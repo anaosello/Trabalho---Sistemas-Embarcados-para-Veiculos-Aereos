@@ -1396,3 +1396,134 @@ Tempos estimados, não medidos, a partir da contagem das instruções no objdump
 - Um índice de canal 0 ou de 5 a 7 vindo da EEPROM continua sem tratamento (o 0 lê `receiver_input[0]`, que nunca é escrito, e 5 a 7 leem fora do vetor); é um problema anterior.
 - A AP.3 não implementa um failsafe; o diagnóstico da perda de sinal do receptor fica para a E.3.
 - O `volatile` dos `receiver_input_channel_*` (linha 47) foi mantido, embora não seja necessário.
+
+---
+
+## Melhoria E.3 — Diagnóstico de perda do sinal do receptor
+
+**Responsável:** E (identificação e contribuição individual a confirmar)
+
+**Branch:** `feat/receiver-failsafe`
+
+**Arquivo criado:** `tests/receiver_diagnostics/receiver_diagnostics.ino` (sketch independente); também alterado: `README.md`.
+
+Os números de linha do `YMFC-AL_setup.ino` são os da develop (`a6571e1`).
+
+Apesar do nome da branch, a E.3 é um diagnóstico com dados simulados, e não um failsafe. O planejamento previa preservar um sketch de diagnóstico já desenvolvido; ele não foi localizado em nenhuma branch nem no histórico, e este sketch é uma implementação nova.
+
+### 1. Problema identificado
+
+A E.1 (Melhoria 1) já classifica os canais em `wait_for_receiver()`, mas só no setup: o diagnóstico por canal (linhas 818–829) só aparece depois do limite de 10 s e usa a última leitura. Como depende do receptor físico, os casos de canal ausente, desatualizado e com pulso inválido não podem ser examinados um a um, com dados conhecidos. O `YMFC-AL_Flight_controller.ino` não verifica se os pulsos estão sendo atualizados, e a AP.3 deixou esse diagnóstico para a E.3. Termos usados, com os critérios da E.1:
+
+- **Ausente:** o bit do canal em `received_channels` (copiado para `received_mask` na linha 754) vale 0. A ISR (linhas 922–1010) liga esse bit no primeiro pulso e nunca o zera; por isso, ausente significa "nunca recebeu pulso desde o reset".
+- **Desatualizado:** o último pulso tem 100 ms ou mais (`now - pulse_times[i] >= RECEIVER_TIMEOUT_US`).
+- **Pulso inválido:** o canal está presente e recente, mas a largura não fica entre 900 e 2100 µs (limites exclusivos).
+
+### 2. Conteúdo das aulas relacionado
+
+- Aula 0x0002 (Revisão de Linguagem C), pp. 24–25: struct, uma sequência de memória "composta de tipos não necessariamente iguais", com campos acessados pelo operador `.` (a `ReceiverSample`, em `sample.channels[i]`). Aula 0x0002, pp. 22–23: arrays, "Sequências contínuas (em memória) de valores do mesmo tipo", criados estaticamente e acessados com `[ ]` (os campos `channels[4]` e `pulse_times[4]`).
+- Aula 0x0002, pp. 28–29: funções com parâmetros por valor e `return` (exemplo `int Soma( int a, int b )`); `classify_channel()` e `diagnose_sample()` recebem cópias e devolvem um `byte`. Aula 0x0002, pp. 20–21: ponteiros e alocação dinâmica com `malloc`/`free`, como contraste: o sketch não aloca memória dinamicamente; as amostras são globais, e a struct é passada por valor.
+- Aula 0x0002, p. 9 (`if`/`else`, na prioridade dos estados), p. 11 (`switch`/`case`, em `print_state()`), pp. 14–15 (`for`, nos canais e nos bits da máscara) e p. 19 (operadores lógicos `>`, `<`, `==`, `!=`, `&&`, `!` e binários `&`, `|`, `<<`, `>>`).
+- Aula 0x0002, pp. 3–5: tipos. O slide dá `int` com 32 bits "[16 bits (2 bytes) em plataformas mais antigas]", `bool` (p. 4) e `unsigned long int (uint32_t)` (p. 5), o tipo dos instantes.
+- Aula 0x0001, p. 22: linguagem estruturada, que "apresenta recurso de funções, estruturas de repetições, condicionais etc". Aula 0x0001, p. 17: `-Wall` ("Enable All Warning Messages").
+- Sistemas Embarcados (EESC, Ago/2026), p. 25: "Comunicação (alguns!)", que lista a Serial; o diagnóstico é mostrado pelo monitor serial.
+- Protocolos CAN, só como analogia: p. 55 (heartbeat do CANopen: "O consumidor detecta a falha de um nó quando o heartbeat não chega no prazo configurado"), p. 76 (supervisão de nós por heartbeat/timeout) e p. 61 (no Cyphal, a única função obrigatória é publicar o Heartbeat uma vez por segundo). Aqui, o pulso de cada canal faz o papel do heartbeat e `RECEIVER_TIMEOUT_US`, o do prazo. Nada de CAN é implementado.
+- Relação com outras melhorias: os critérios são os da E.1, e a comparação de tempo usa a subtração sem sinal, que continua correta no rollover (H.2).
+
+Conhecimento externo às aulas: `Serial.begin`, `Serial.print` e `Serial.println`; o macro `F()`, que mantém os textos na Flash; os literais `B0000xxxx` (`binary.h` do core); os protótipos gerados automaticamente pelo Arduino antes da primeira função (por isso a struct é declarada no topo, antes de qualquer função); o fato de que, no AVR, uma variável `const` global fica na SRAM; o `int` de 16 bits no AVR (avr-gcc); o tipo `byte` do Arduino e o sufixo `UL` nos literais `unsigned long`; e o `--warnings all` do Arduino CLI, que no core AVR liga `-Wall -Wextra` (`platform.txt`).
+
+### 3. Alteração realizada
+
+Foi criado o sketch `tests/receiver_diagnostics/receiver_diagnostics.ino`, que fica numa pasta com o mesmo nome, como exige o Arduino. Cada amostra simulada é uma struct com os mesmos campos das variáveis locais da E.1:
+
+| Campo de `ReceiverSample` | Variável da E.1 | Linha |
+|---|---|---:|
+| `int channels[4]` | `int channels[4]` | 734 |
+| `unsigned long pulse_times[4]` | `unsigned long pulse_times[4]` | 736 |
+| `byte received_mask` | `byte received_mask` (bit i = canal i+1) | 732 |
+| `unsigned long now` | `unsigned long now` (aqui, um valor fixo) | 737 |
+
+A struct agrupa uma amostra inteira, e não um canal: assim ficam preservados a máscara de bits e os operadores binários da E.1. `RECEIVER_TIMEOUT_US` tem o mesmo nome, tipo e valor da linha 38, e os estados são as constantes `CHANNEL_VALID`, `CHANNEL_ABSENT`, `CHANNEL_STALE` e `CHANNEL_INVALID`. Funções: `classify_channel()` (estado de um canal), `print_state()` (nome do estado, com `switch`/`case`), `print_mask()` (bits 3..0, com contador `int`, porque com `byte` o `bit--` em 0 viraria 255 e o laço não terminaria) e `diagnose_sample()` (imprime os quatro canais, a máscara e "Quatro canais validos: SIM/NAO", e devolve a máscara). Trecho de `classify_channel()`, depois das três condições (as mesmas expressões da E.1, na tabela da seção 4):
+
+```cpp
+if(!pulse_received){
+  return CHANNEL_ABSENT;
+}
+else if(!recent_pulse){
+  return CHANNEL_STALE;
+}
+else if(!valid_width){
+  return CHANNEL_INVALID;
+}
+return CHANNEL_VALID;
+```
+
+A prioridade é ausente > desatualizado > pulso inválido. Sem presença, o pulso e o instante são só valores iniciais; um pulso antigo não representa a medida atual; só um pulso presente e recente tem a largura julgada.
+
+Nos canais ausentes, o pulso e o decorrido impressos vêm dos valores iniciais (0 e `now - 0`) e aparecem só para mostrar que a ausência tem prioridade.
+
+Restabelecimento: `diagnose_sample()` recebe a máscara do diagnóstico anterior e marca `(RESTABELECIDO)` quando o canal está válido agora e o seu bit vale 0 no histórico, qualquer que tenha sido o estado anterior: ausente, inválido ou desatualizado. O caso desatualizado → válido é a recuperação de uma perda de sinal. Como depende do histórico, e não só da amostra atual, o restabelecimento não é um estado de `classify_channel()`. Os 12 cenários rodam uma vez no `setup()`, com instantes simulados e sem `micros()`; o `loop()` fica vazio. Os três sketches originais não foram alterados.
+
+### 4. Justificativa
+
+| Critério | E.1 (`YMFC-AL_setup.ino`) | Sketch |
+|---|---|---|
+| Largura | `channels[i] > 900 && channels[i] < 2100` (linhas 764–766) | `pulse > 900 && pulse < 2100` |
+| Presença | `(received_mask & (1 << i)) != 0` (linhas 769–770) | a mesma expressão |
+| Recência | `(now - pulse_times[i]) < RECEIVER_TIMEOUT_US` (linhas 773–774) | `(now - pulse_time) < RECEIVER_TIMEOUT_US` |
+| Máscara | `valid_channels \|= (1 << i)` (linha 779) | `valid_mask \|= (1 << i)` |
+| Quatro válidos | `valid_channels == B00001111` (linha 784) | `valid_mask == B00001111` |
+| Prioridade | linhas 818–829 | a mesma ordem |
+
+Não há limites novos, e a prioridade é a mesma da E.1. Os dados são simulados para que o resultado seja reproduzível e porque não há placa disponível. O rollover é tratado pela subtração sem sinal (H.2). O sketch é independente: é gravado sozinho e não configura pinos, não tem ISR e não aciona motores. **Não é um failsafe real e não interfere no funcionamento do drone.**
+
+### 5. Resultados de compilação
+
+Em 27/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os sketches foram compilados com `--clean --warnings all` a partir de cópias em pastas separadas. A referência ("antes") foi exportada da develop (`a6571e1`), e a versão "depois" foi copiada da cópia de trabalho.
+
+| `receiver_diagnostics.ino` | Valor |
+|---|---:|
+| Flash utilizada | 4590 bytes (14%) |
+| SRAM global utilizada | 506 bytes (24%; sobram 1542 bytes para variáveis locais) |
+
+Pelo `avr-nm`, as 11 amostras ocupam 29 bytes cada (319 bytes) na seção `.data`.
+
+| Sketch | Flash antes | Flash depois | SRAM global antes | SRAM global depois |
+|---|---:|---:|---:|---:|
+| `YMFC-AL_Flight_controller.ino` | 12410 bytes | 12410 bytes | 501 bytes | 501 bytes |
+| `YMFC-AL_esc_calibrate.ino` | 13444 bytes | 13444 bytes | 1114 bytes | 1114 bytes |
+| `YMFC-AL_setup.ino` | 20680 bytes | 20680 bytes | 532 bytes | 532 bytes |
+
+Avisos: o diagnóstico compilou sem erros e sem avisos de `receiver_diagnostics.ino`; só aparecem os 4 avisos de `new.cpp` do core. Os três originais tiveram os mesmos avisos antes e depois (4 de `new.cpp` em cada um e, no setup, 1 já existente em `wait_for_receiver()`). Os valores não se somam: o diagnóstico e os três sketches são programas distintos, gravados um de cada vez.
+
+### 6. Verificações realizadas
+
+Por inspeção do código, contas à mão e compilação; sem placa e sem simulador.
+
+| # | Dados simulados | Condição esperada | Resultado previsto |
+|---|---|---|---|
+| 1 | base: pulsos 1500/1500/1000/1500, decorridos 10000/15000/5000/20000 µs | todos presentes, recentes e com largura válida | V/V/V/V, máscara 1111, SIM |
+| 2 | canal 2 com bit 0 na máscara | canal 2 ausente | V/AUSENTE/V/V, 1101 |
+| 3 | canais 3 e 4 com bit 0 | dois ausentes | V/V/AUSENTE/AUSENTE, 0011 |
+| 4 | canal 1 = 850 µs | largura abaixo de 900 | PULSO INVALIDO/V/V/V, 1110 |
+| 5 | `restored` com o histórico 1110 do cenário 4 | canal 1 volta a ser válido | canal 1 VALIDO (RESTABELECIDO), 1111, SIM |
+| 6 | canal 4 = 2200 µs | largura acima de 2100 | V/V/V/PULSO INVALIDO, 0111 |
+| 7 | decorridos 200000/205000/195000/210000 µs | perda do sinal nos quatro | DESATUALIZADO nos quatro, 0000 |
+| 8 | pulsos 900/901/2099/2100 µs | limites exclusivos | PULSO INVALIDO/V/V/PULSO INVALIDO, 0110 |
+| 9 | decorridos 99999/100000/100001/0 µs | 100000 já é desatualizado | V/DESAT/DESAT/V, 1001 |
+| 10 | `now` = 50000, instantes antes da volta a zero (`0xFFFF3CB1`, `0xFFFF3CB0`, `0xFFFFFFFF`, 40000) | decorridos 99999/100000/50001/10000 | V/DESAT/V/V, 1101 |
+| 11 | canal 1 ausente; canal 2 com 2500 µs e 200000 µs; canal 3 com 500 µs; canal 4 com 150000 µs | prioridade entre os problemas | AUSENTE/DESAT/PULSO INVALIDO/DESAT, 0000 |
+| 12 | `restored` com o histórico 0000 do cenário 11 | ausente, desatualizados e inválido voltam a ser válidos | os quatro VALIDO (RESTABELECIDO), 1111, SIM |
+
+Contraste com a H.2: com instante `0xFFFFFFF0` (4294967280) e `now = 0xFFFFFFF8` (4294967288), `now - instante` dá 8, ou seja, recente. Já a forma `now < instante + RECEIVER_TIMEOUT_US` daria `instante + 100000 = 99984` (o valor dá a volta), e `4294967288 < 99984` é falso: o canal seria julgado desatualizado por engano.
+
+A saída do monitor serial não foi observada; os resultados são os previstos pela análise do código. A compilação confirma só que o sketch é aceito pelo compilador e mostra o uso de memória; a análise conceitual (contas à mão sobre os critérios da E.1) dá os resultados da tabela; a execução experimental, em placa, não foi feita.
+
+### 7. Limitações
+
+- O sketch não foi executado em placa.
+- Os dados simulados não reproduzem a ISR, o jitter, a resolução de 4 µs do `micros()` nem a leitura atômica.
+- As 5 verificações consecutivas e o limite de 10 s da E.1 não são reproduzidos.
+- Um receptor que continua gerando pulsos válidos depois de perder o transmissor não seria detectado.
+- O diagnóstico não está ligado ao controlador de voo; o voo continua sem detecção de perda de sinal, e não há failsafe, pouso nem corte de motores.
+- O limite de 100 ms ainda precisa ser confirmado com o receptor real.
