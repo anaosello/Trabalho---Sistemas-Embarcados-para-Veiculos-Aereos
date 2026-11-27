@@ -529,8 +529,9 @@ byte search_gyro(int gyro_address, int who_am_i){
   //interrompe o setup.
   if(Wire.endTransmission() != 0)return 0;
   if(Wire.requestFrom(gyro_address, 1) != 1)return 0;
-  timer = millis() + 100;
-  while(Wire.available() < 1 && timer > millis());
+  //timer guarda o instante inicial; o tempo decorrido (millis() - timer, sem sinal) continua certo apos o rollover.
+  timer = millis();
+  while(Wire.available() < 1 && millis() - timer < 100);
   lowByte = Wire.read();
   address = gyro_address;
   return lowByte;
@@ -638,8 +639,9 @@ void gyro_signalen(){
 void check_receiver_inputs(byte movement){
   byte trigger = 0;
   int pulse_length;
-  timer = millis() + 30000;
-  while(timer > millis() && trigger == 0){
+  //timer guarda o instante inicial; o tempo decorrido (millis() - timer, sem sinal) continua certo apos o rollover.
+  timer = millis();
+  while(millis() - timer < 30000 && trigger == 0){
     delay(250);
     if(receiver_input_channel_1 > 1750 || receiver_input_channel_1 < 1250){
       trigger = 1;
@@ -869,8 +871,9 @@ void check_gyro_axes(byte movement){
   gyro_angle_yaw = 0;
   gyro_signalen();
   if(error == 1)return;        //Falha I2C: sai sem usar a leitura (ERROR 9 ja foi informado).
-  timer = millis() + 10000;    
-  while(timer > millis() && gyro_angle_roll > -30 && gyro_angle_roll < 30 && gyro_angle_pitch > -30 && gyro_angle_pitch < 30 && gyro_angle_yaw > -30 && gyro_angle_yaw < 30){
+  //timer guarda o instante inicial; o tempo decorrido (millis() - timer, sem sinal) continua certo apos o rollover.
+  timer = millis();
+  while(millis() - timer < 10000 && gyro_angle_roll > -30 && gyro_angle_roll < 30 && gyro_angle_pitch > -30 && gyro_angle_pitch < 30 && gyro_angle_yaw > -30 && gyro_angle_yaw < 30){
     gyro_signalen();
     if(error == 1)return;      //Falha I2C: sai sem integrar a leitura invalida.
     if(type == 2 || type == 3){
