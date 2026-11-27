@@ -934,3 +934,75 @@ Análise conceitual, por inspeção do código e compilação, sem observação 
 - Não há recuperação nem nova tentativa: o setup é interrompido.
 - O limite de 25 ms vale para cada espera interna da Wire, não para a transação inteira; em caso de falha, a demora até a mensagem de erro pode somar algumas dezenas de milissegundos. O timeout só foi configurado no setup.
 - `YMFC-AL_Flight_controller.ino` e `YMFC-AL_esc_calibrate.ino` continuam com esperas I²C sem timeout; as comparações temporais com `millis()` ficam para a melhoria H.2.
+
+---
+
+## Melhoria H.2 — Correção das comparações temporais
+
+**Responsável:** H (identificação completa a confirmar)
+
+**Branch:** `fix/loop-timing`
+
+**Arquivos modificados:** `YMFC-AL_setup.ino` e `README.md`.
+
+### 1. Problema identificado
+
+`millis()` conta os milissegundos desde o reset em um número de 32 bits sem sinal e volta a zero depois de cerca de 49,7 dias (`micros()`, depois de cerca de 71,6 minutos).
+No `YMFC-AL_setup.ino`, três esperas calculavam um instante futuro (`timer = millis() + X;`) e o comparavam com o atual (`while(timer > millis() ...)`): `search_gyro()` (100 ms), `check_receiver_inputs()` (30 s) e `check_gyro_axes()` (10 s).
+Se a espera começar perto da volta a zero, a soma também dá a volta e vira um número pequeno; a condição já começa falsa e a espera termina na hora. Em `check_receiver_inputs()` e `check_gyro_axes()`, isso mostraria ERROR 2 ou ERROR 4 sem esperar o movimento do usuário.
+
+### 2. Conteúdo das aulas relacionado
+
+- Aula 0x0002 (Revisão de Linguagem C), p. 3: `int` com 32 bits, "[16 bits (2 bytes) em plataformas mais antigas]", com os limites dos tipos em `limits.h`. Os limites 100, 10000 e 30000 são constantes `int` que cabem nesses 16 bits e são comparadas com `millis() - timer` (`unsigned long`).
+- Aula 0x0002, p. 5: `unsigned` faz o tipo representar "apenas números não negativos"; entre os modificadores aparece `unsigned long int (uint32_t)`, o tipo de `timer` e do valor de `millis()`.
+- Aula 0x0002, p. 14 (estruturas de repetição) e p. 18 (`while`, com a "condição para permanência no laço"): as três esperas são laços `while` cuja condição define quanto tempo o programa fica neles.
+- Aula 0x0002, p. 19: operadores matemáticos (`+`, `-`) e lógicos (`<`, `>`, `&&`) usados nas condições.
+
+O estouro e a volta a zero (wrap-around) de inteiros não são ensinados nas aulas.
+
+Conhecimento externo às aulas: no core `arduino:avr` 1.8.8, `millis()` e `micros()` são declaradas em `Arduino.h`, implementadas em `wiring.c` e retornam `unsigned long`. No avr-gcc usado pelo core, `int` tem 16 bits e `long` tem 32 bits (`uint32_t` é `unsigned long`); por isso os contadores voltam a zero após 2^32 ms ou 2^32 µs. Soma e subtração de inteiros sem sinal são feitas módulo 2^32: o resultado dá a volta, em vez de ficar negativo. Na comparação com `millis() - timer`, as constantes `int` (16 bits no avr-gcc) são convertidas para `unsigned long`; por isso o sufixo `UL` não é necessário.
+
+### 3. Alteração realizada
+
+Nos três pontos, `timer` passou a guardar o instante inicial e a condição passou a medir o tempo decorrido, com um comentário curto em cada ponto:
+
+| Função | Antes | Depois |
+|---|---|---|
+| `search_gyro()` | `timer = millis() + 100;` e `timer > millis()` | `timer = millis();` e `millis() - timer < 100` |
+| `check_receiver_inputs()` | `timer = millis() + 30000;` e `timer > millis()` | `timer = millis();` e `millis() - timer < 30000` |
+| `check_gyro_axes()` | `timer = millis() + 10000;` e `timer > millis()` | `timer = millis();` e `millis() - timer < 10000` |
+
+Os limites, as demais condições dos laços, as mensagens e a sequência do setup não mudaram, e nenhuma variável foi criada. A espera de `search_gyro()` continua redundante desde a AO.2 (o retorno de `requestFrom()` já é conferido), mas foi corrigida e mantida, e não removida. `wait_for_receiver()` (E.1) e a rotina de interrupção do receptor já usavam diferenças de tempo e não foram alteradas.
+
+### 4. Justificativa
+
+`millis() - timer` é o tempo decorrido desde o início da espera. Como a subtração sem sinal é feita módulo 2^32, o resultado continua correto mesmo se `millis()` voltar a zero no meio da espera, desde que o tempo decorrido seja menor que cerca de 49,7 dias. No original, `timer = millis() + X;` com `timer > millis()` falhava de dois modos: se a soma dava a volta, `timer` virava um número pequeno e a espera terminava na hora; se a soma não dava a volta, mas o fim previsto ficava muito perto do máximo, `millis()` podia passar desse fim e voltar a zero entre duas verificações do laço (possível com o `delay(250)` de `check_receiver_inputs()`), e então `timer > millis()` voltava a ser verdadeiro e a espera só terminaria com movimento do stick ou após cerca de 49,7 dias. O novo cálculo evita os dois casos.
+Em funcionamento normal, a condição de saída mantém o mesmo limite temporal, com limite estrito e o caso "igual" tratado como antes: o original sai quando `millis()` chega a `timer` (início + X), e o novo, quando o decorrido chega a X. O encerramento efetivo depende de quando a condição é avaliada, ou seja, da frequência das verificações do laço (por exemplo, o `delay(250)` de `check_receiver_inputs()`); não houve medição experimental. É uma correção de comportamento, sem ganho de desempenho ou de precisão.
+
+### 5. Resultados de compilação
+
+Em 26/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os sketches foram compilados a partir de cópias em pastas separadas.
+
+| `YMFC-AL_setup.ino` | Referência da develop (`9e58c60`) | Versão modificada |
+|---|---:|---:|
+| Flash utilizada | 20686 bytes | 20680 bytes |
+| SRAM global utilizada | 532 bytes | 532 bytes |
+
+O setup passou a ocupar 6 bytes a menos de Flash, sem mudança de SRAM global. `YMFC-AL_Flight_controller.ino` e `YMFC-AL_esc_calibrate.ino` não mudaram e compilaram com os mesmos valores da referência (12548/501 e 13126/1106 bytes de Flash/SRAM global).
+Com `--warnings all`, o setup apresentou os mesmos 5 avisos antes e depois (4 de `new.cpp` do core e 1 já existente em `wait_for_receiver()`); nenhum aviso novo.
+
+### 6. Verificações realizadas
+
+Contas feitas à mão sobre o código, sem observação em hardware:
+
+1. Funcionamento normal (`check_receiver_inputs()`, início em 5000 ms, limite de 30000 ms): com `millis()` = 20000, o decorrido é 15000 e a espera continua; em 34999, 29999, continua; em 35000, 30000, sai. No original, `timer` = 35000: `35000 > 34999` continua e `35000 > 35000` é falso e sai, ou seja, o limite de saída é o mesmo. Nos dois casos, o laço só detecta esse limite na verificação seguinte da condição, feita depois de cada `delay(250)`.
+2. Perto da volta a zero (início em 4 294 962 296 = 2^32 − 5000, limite de 30000 ms): no original, `timer` = (início + 30000) mod 2^32 = 25000 e `25000 > 4 294 962 296` é falso, então a espera termina na hora (ERROR 2 sem esperar). No novo, o decorrido vale 0 no início, 4999 em `millis()` = 4 294 967 295, 5000 em `millis()` = 0, 29999 em 24999 (continua) e 30000 em 25000 (condição de saída atingida 30 s após o início). Em `check_gyro_axes()` (10000 ms), com o mesmo início, o original teria `timer` = 5000 e terminaria na hora (ERROR 4); no novo, a condição de saída é atingida em `millis()` = 5000, 10 s após o início.
+
+As demais condições de saída (movimento do stick, ângulo fora de ±30°, byte disponível na Wire) continuam encerrando os laços como antes.
+
+### 7. Limitações
+
+- No setup, a volta a zero quase nunca acontece, porque o sketch roda logo após o reset.
+- Não houve teste em hardware nem simulação.
+- O mesmo padrão de instante futuro continua em `YMFC-AL_esc_calibrate.ino` (linha 93, com `micros()`) e na geração dos pulsos dos ESCs (`YMFC-AL_Flight_controller.ino`, linhas 350–365, e `YMFC-AL_esc_calibrate.ino`, linhas 442–454). Esses trechos ficaram fora do escopo, sem alterar o período nominal do laço nem a temporização dos pulsos.
+- Uma espera maior que cerca de 49,7 dias não seria medida corretamente, o que é irrelevante para limites de no máximo 30 s.
