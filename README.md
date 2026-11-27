@@ -1006,3 +1006,85 @@ As demais condições de saída (movimento do stick, ângulo fora de ±30°, byt
 - Não houve teste em hardware nem simulação.
 - O mesmo padrão de instante futuro continua em `YMFC-AL_esc_calibrate.ino` (linha 93, com `micros()`) e na geração dos pulsos dos ESCs (`YMFC-AL_Flight_controller.ino`, linhas 350–365, e `YMFC-AL_esc_calibrate.ino`, linhas 442–454). Esses trechos ficaram fora do escopo, sem alterar o período nominal do laço nem a temporização dos pulsos.
 - Uma espera maior que cerca de 49,7 dias não seria medida corretamente, o que é irrelevante para limites de no máximo 30 s.
+
+---
+
+## Melhoria AP.2 — Reutilização do processamento dos comandos
+
+**Responsável:** AP (identificação completa a confirmar)
+
+**Branch:** `refactor/receiver-command`
+
+**Arquivos modificados:** `YMFC-AL_Flight_controller.ino` e `README.md`.
+
+### 1. Problema identificado
+
+No `loop()`, o setpoint de cada eixo é calculado a partir do pulso padronizado do receptor (1000 a 2000 µs). Em torno do centro do stick existe uma zona morta, de 1492 a 1508 µs (inclusive), em que a contribuição do receptor vale zero, para que pequenas variações do stick ou do receptor em repouso não gerem comando; em roll e pitch, o setpoint final ainda inclui a correção de nivelamento, e no yaw, que não tem nivelamento, o setpoint fica zero. Acima dela, o comando é `pulso - 1508`; abaixo, `pulso - 1492`.
+O mesmo par `if`/`else if` aparecia três vezes, para roll (canal 1), pitch (canal 2) e yaw (canal 4); qualquer mudança nos limites teria de ser repetida nos três lugares.
+
+### 2. Conteúdo das aulas relacionado
+
+- Aula 0x0002, p. 28: função é uma rotina com identificador próprio, que "permite repetição de operações sem reescrita de código", pode receber parâmetros e retornar resultados, com passagem de argumentos por valor.
+- Aula 0x0002, p. 29: o exemplo `int Soma( int a, int b )` recebe dois `int` por valor e devolve um `int` com `return`, o mesmo formato da nova função.
+- Aula 0x0002, p. 9: condicional `if`/`else`, usada para separar os três casos (acima, abaixo e dentro da zona morta).
+- Aula 0x0002, p. 19: operadores matemáticos (`-`) e lógicos (`>`, `<`) usados no cálculo.
+- Aula 0x0002, p. 3: tipos `int` e `float`; `int` com "[16 bits (2 bytes) em plataformas mais antigas]".
+
+Conhecimento externo às aulas: no avr-gcc usado pelo core `arduino:avr`, `int` tem 16 bits e `double` é tratado como `float` (32 bits), por isso as divisões por `3.0` são feitas em 32 bits, antes e depois da mudança. No `.ino`, o pré-processamento do Arduino gera o protótipo da função automaticamente, como já ocorre com `reset_pid()`.
+
+### 3. Alteração realizada
+
+Foi criada a função `int apply_dead_band(int pulse)`, logo após `reset_pid()`. Ela recebe o pulso por parâmetro e devolve a diferença até a zona morta: `pulse - 1508` se `pulse > 1508`, `pulse - 1492` se `pulse < 1492` e `0` nos demais casos. As condições, os limites e as subtrações são os mesmos do original, na mesma ordem.
+No `loop()`, foram feitas três substituições, com um comentário curto em cada uma:
+
+| Eixo | Antes | Depois |
+|---|---|---|
+| Roll | `pid_roll_setpoint = 0;` e o par `if`/`else if` com `receiver_input_channel_1` | `pid_roll_setpoint = apply_dead_band(receiver_input_channel_1);` |
+| Pitch | `pid_pitch_setpoint = 0;` e o par `if`/`else if` com `receiver_input_channel_2` | `pid_pitch_setpoint = apply_dead_band(receiver_input_channel_2);` |
+| Yaw | o par `if`/`else if` com `(receiver_input_channel_4 - 1508)/3.0` e `(receiver_input_channel_4 - 1492)/3.0` | `pid_yaw_setpoint = apply_dead_band(receiver_input_channel_4)/3.0;` |
+
+Em roll e pitch, as linhas seguintes (`-= roll_level_adjust` / `-= pitch_level_adjust` e `/= 3.0`) não mudaram e continuam depois da chamada. No yaw, continuam `pid_yaw_setpoint = 0;`, a condição `if(receiver_input_channel_3 > 1050)` (não aplicar yaw ao desligar os motores), a divisão por `3.0` na mesma posição e a ausência de nivelamento. Os comentários originais foram mantidos; nenhuma variável global foi criada.
+
+### 4. Justificativa
+
+Os limites 1492 e 1508 passam a ficar em um único ponto do código, e o cálculo repetido nos três eixos passa a ser escrito uma vez (Aula 0x0002, p. 28). Trata-se de uma refatoração: a zona morta já existia e nenhum mecanismo novo de controle foi criado.
+
+### 5. Resultados de compilação
+
+Em 27/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os sketches foram compilados a partir de cópias em pastas separadas.
+
+| `YMFC-AL_Flight_controller.ino` | Referência da develop (`e878bc7`) | Versão modificada |
+|---|---:|---:|
+| Flash utilizada | 12548 bytes | 12404 bytes |
+| SRAM global utilizada | 501 bytes | 501 bytes |
+| SRAM restante para variáveis locais | 1547 bytes | 1547 bytes |
+
+A diferença de Flash depende de como o compilador organiza o código gerado; ela não foi analisada e não é apresentada como ganho. `YMFC-AL_setup.ino` e `YMFC-AL_esc_calibrate.ino` não mudaram e compilaram com os mesmos valores da referência (20680/532 e 13126/1106 bytes de Flash/SRAM global).
+Com `--warnings all`, os três sketches apresentaram os mesmos avisos antes e depois (4 de `new.cpp` do core em cada um e, no setup, 1 já existente em `wait_for_receiver()`); nenhum aviso novo.
+
+### 6. Verificações realizadas
+
+Pelo diff, as condições, os limites e as subtrações removidos do `loop()` são os mesmos do corpo de `apply_dead_band()`. Quanto aos tipos: no original, `receiver_input_channel_x - 1508` era uma subtração `int - int`, convertida para `float` na atribuição; agora a função devolve o mesmo `int`, atribuído à mesma variável `float`. No yaw, o `int` continua sendo dividido por `3.0` como antes. Na zona morta, a contribuição do receptor (retorno convertido para `float`) é `0.0` nos dois casos; o setpoint final de roll e pitch depende ainda do ajuste de nível, como mostra a tabela. Com o pulso entre 1000 e 2000 µs, o retorno fica entre −492 e 492, sem risco de estouro do `int` de 16 bits.
+
+Contas feitas à mão (roll/pitch = (retorno − ajuste de nível) / 3,0; yaw = retorno / 3,0 com canal 3 > 1050), iguais para o código original e o modificado:
+
+| Pulso (µs) | Caso | Retorno | Roll/pitch, ajuste 0 | Ajuste +30,0 | Ajuste −45,0 | Yaw |
+|---:|---|---:|---:|---:|---:|---:|
+| 1000 | abaixo da zona morta | −492 | −164 | −174 | −149 | −164 |
+| 1491 | logo abaixo do limite inferior | −1 | −0,3333 | −10,3333 | 14,6667 | −0,3333 |
+| 1492 | igual ao limite inferior | 0 | 0 | −10 | 15 | 0 |
+| 1493, 1500, 1507 | dentro (1500 = centro) | 0 | 0 | −10 | 15 | 0 |
+| 1508 | igual ao limite superior | 0 | 0 | −10 | 15 | 0 |
+| 1509 | logo acima do limite superior | 1 | 0,3333 | −9,6667 | 15,3333 | 0,3333 |
+| 2000 | acima da zona morta | 492 | 164 | 154 | 179 | 164 |
+
+O ajuste de nível é `roll_level_adjust` ou `pitch_level_adjust`, calculado como ângulo × 15 (+30,0 corresponde a 2° e −45,0 a −3°; com `auto_level = false` vale 0). No yaw, com o canal 3 em 1049 ou 1050 (condição estrita), o setpoint fica 0 qualquer que seja o canal 4; com o canal 3 em 1051, o canal 4 em 2000, 1000 e 1500 dá 164, −164 e 0.
+
+A verificação foi feita por inspeção do código, contas à mão e compilação; não comprova equivalência temporal nem o funcionamento físico.
+
+### 7. Limitações
+
+- Não houve teste em hardware nem medição do tempo de execução, e os binários gerados não foram comparados.
+- O original lia cada canal `volatile` duas ou três vezes (comparações e subtração); o novo lê uma vez e passa a cópia por valor. A diferença não altera o resultado, porque esses canais só são escritos no contexto principal (`gyro_signalen()` e `setup()`), e não pela rotina de interrupção.
+- Na zona morta, roll e pitch passam a sempre converter o retorno `int` para `float`, e o yaw (com canal 3 > 1050) passa a sempre fazer a divisão por `3.0`, operações que antes eram puladas. Há ainda uma chamada de função por eixo no código-fonte (o compilador pode ou não expandi-la no local); o efeito no tempo do laço não foi medido.
+- A atomicidade da leitura dos dados do receptor gravados pela rotina de interrupção não foi tratada aqui e fica para a AP.3.
