@@ -1527,3 +1527,130 @@ A saída do monitor serial não foi observada; os resultados são os previstos p
 - Um receptor que continua gerando pulsos válidos depois de perder o transmissor não seria detectado.
 - O diagnóstico não está ligado ao controlador de voo; o voo continua sem detecção de perda de sinal, e não há failsafe, pouso nem corte de motores.
 - O limite de 100 ms ainda precisa ser confirmado com o receptor real.
+
+---
+
+## Melhoria H.3 — Validação das configurações armazenadas na EEPROM
+
+**Responsável:** H (identificação completa a confirmar)
+
+**Branch:** `feat/eeprom-validation`
+
+**Arquivos modificados:** `YMFC-AL_Flight_controller.ino` e `README.md`. O `YMFC-AL_setup.ino` foi apenas consultado.
+
+Os números de linha "originais" são os da develop (`22f1116`); os novos são os da versão modificada.
+
+### 1. Problema identificado
+
+O setup grava 36 bytes na EEPROM (H.1) e, por último, a assinatura `'J'`, `'M'`, `'B'` (endereços 33–35). O controlador de voo só confere essa assinatura (linha 112 original). A assinatura só mostra que, em algum momento, o setup chegou a gravá-la; não garante que a última gravação terminou nem que os outros bytes sejam coerentes. Como o setup grava os endereços 0–32 antes da assinatura (com `EEPROM.update()`), a assinatura de uma configuração anterior continua nos endereços 33–35 durante uma nova gravação: uma queda de alimentação no meio deixa dados misturados com assinatura válida. O mesmo ocorre se a verificação do setup falhar (ERROR 5), que não apaga a assinatura. Um byte corrompido, uma calibração mal feita ou dados gravados por outro programa também passam pela verificação. Os parâmetros do receptor são usados em `convert_receiver_channel()` como índice de array e como divisor:
+
+| Dado inválido | Efeito no código original |
+|---|---|
+| identificação 0 | lê `receiver_input[0]`, nunca escrito, e `eeprom_data[-2]`/`[-1]`, fora do array |
+| identificação 5 a 7 | lê `receiver_input[5..7]`, fora do array, e calibrações de outros campos |
+| mínimo = centro ou centro = máximo | divisão inteira por zero (`center - low` ou `high - center`) |
+| mínimo > centro ou centro > máximo | qualquer movimento vira comando extremo (1000 ou 2000 µs), sem proporcionalidade |
+| mínimo negativo (diferença `center - low` > 32767) | estouro do `int` no divisor; com low = −32768, o curso real abaixo do centro (1000 a 1500 µs) vira 1500–1507 µs (cenário 15) |
+| mínimo 0 | conversão comprimida: o fim real do curso (1000 µs) dá 1334 µs (cenário 16) |
+| entradas repetidas | duas funções seguem o mesmo stick e uma entrada fica sem uso |
+
+Além disso, o setup não compara mínimo, centro e máximo antes de gravar, e não impede de forma estrita identificações repetidas. A ISR do setup guarda 0 quando o pulso é inválido (> 32767 µs; comportamento introduzido pela E.1, não presente no setup original), e `register_min_max()` não filtra esse valor: um pulso inválido durante a medição dos extremos grava mínimo 0.
+
+As configurações se dividem em três grupos:
+
+- **coerentes** (≈1000/1500/2000 µs, identificações 1–4 distintas): o que uma calibração normal, com o receptor funcionando, costuma gravar. Aceitas antes e depois, com o mesmo comportamento;
+- **inconsistentes que o setup pode gravar**: mínimo 0, ordem incoerente e entradas repetidas, agora recusados; e mínimos/máximos espúrios ainda positivos, que continuam aceitos, sem estouro, mas com conversão comprimida (limitação: recusá-los exigiria limites absolutos);
+- **que o setup não grava**: valores negativos (byte alto ≥ 0x80), identificações fora de 1–4 e EEPROM apagada (0xFF). Só aparecem por corrupção, gravação de outro programa ou EEPROM nunca gravada; recusados.
+
+### 2. Conteúdo das aulas relacionado
+
+- Sistemas Embarcados (EESC, Ago/2026), p. 8 (slide repetido na p. 16): o bloco de memórias (ROM e RAM) na visão geral de um sistema embarcado; p. 21: o Arduino UNO com RAM de 2 KB e ROM de 32 KB; p. 30: "Erros em EEPROM, Flash ou RAM" entre as falhas de energia (a mesma página citada na H.1).
+- Aula 0x0002 (Revisão de Linguagem C), pp. 22–23: arrays como "Sequências contínuas (em memória) de valores do mesmo tipo", acessados com `[ ]` e com índice de base zero; `eeprom_data[36]` e `receiver_input[5]` só têm significado dentro desses limites.
+- Aula 0x0002, p. 3 (`int`, "16 bits (2 bytes) em plataformas mais antigas") e p. 4 (`char` como byte/`uint8_t` e tabela ASCII, a da assinatura; `bool`, o retorno da nova função).
+- Aula 0x0002, p. 9 (`if`), p. 15 (`for`), p. 18 (`while`, o laço que segura a inicialização) e p. 19 (operadores lógicos `<`, `>`, `<=`, `>=`, `!=`, `||`, `!` e binários `&`, `|`, `<<`).
+- Aula 0x0002, pp. 28–29: funções que retornam um resultado (exemplo `int Soma( int a, int b )`).
+- Aula 0x0001, p. 22: linguagem estruturada, com "funções, estruturas de repetições, condicionais"; p. 17: `-Wall`.
+- Protocolos CAN, só como analogia: p. 29 separa o erro de forma ("Campo de valor fixo errado") do erro de CRC; p. 30 mostra que um quadro com erro é descartado por todos, e não usado. A assinatura faz o papel de um campo de valor fixo: estar certa não garante os dados. Nada de CAN foi implementado, e não foi criado CRC (o planejamento proíbe).
+
+Conhecimento externo às aulas: o `int` de 16 bits do avr-gcc; a ordem dos bytes escolhida pelo setup (byte baixo no endereço par); o valor 0xFF de uma EEPROM apagada; o fato de que divisão inteira por zero, acesso fora de um array e estouro de `int` com sinal são comportamento indefinido em C/C++; o fato de que, no avr-gcc (gnu++11), deslocar um byte ≥ 0x80 para o bit de sinal (`<< 8`) dá um valor negativo (comportamento definido pela implementação); os protótipos gerados automaticamente pelo Arduino; e o `--warnings all` do Arduino CLI, que no core AVR liga `-Wall -Wextra` (`platform.txt`).
+
+### 3. Alteração realizada
+
+Como os dados ficam guardados (endereços que a H.3 confere):
+
+| Endereços | Dado | Verificação acrescentada |
+|---|---|---|
+| 0–7, 8–15, 16–23 | centro, máximo e mínimo das entradas 1–4 (D8–D11), `int` em 2 bytes | `0 < low < center < high` em cada entrada |
+| 24–27 | entrada usada por roll, pitch, throttle e yaw; bit 7 = inversão | sem o bit 7, valor entre 1 e 4 |
+| 24–27 | conjunto das quatro | máscara `0b00011110`: as quatro entradas usadas uma vez |
+| 28–32 | eixos, tipo e endereço do giroscópio | nenhuma (seção 7) |
+| 33–35 | `'J'`, `'M'`, `'B'` | a verificação original, sem mudança |
+
+Foi criada a função `bool receiver_settings_valid()` (linhas 584–603, com o cabeçalho de comentários nas linhas 575–583), que só lê `eeprom_data[]`. No primeiro laço, `eeprom_data[function + 23] & 0b01111111` tira apenas o bit de inversão; essa máscara é mais estrita que a `& 0b00000111` da conversão, porque também recusa os bits 3–6, que o setup nunca liga (ex.: 0x09, cenário 10). Em seguida, o laço confere se a entrada está entre 1 e 4 e marca o bit correspondente com `used_channels |= 1 << channel`. Com quatro entradas diferentes, a máscara fica `0b00011110`; uma repetição deixa um bit em 0. No segundo laço, `low`, `center` e `high` são remontados com as mesmas expressões de `convert_receiver_channel()`, e `low <= 0` ou qualquer ordem diferente de `low < center < high` devolve `false`.
+
+No `setup()`, logo depois da verificação da assinatura (linha 112, mantida), foi acrescentado (linha 117):
+
+    while(!receiver_settings_valid())delay(10);
+
+Com configuração inválida, o programa fica nesse laço como no laço da assinatura: o LED do pino 12, aceso na linha 109, continua aceso; os pinos 4–7 já são saídas, mas continuam em LOW e não recebem pulsos; o giroscópio não é configurado, o receptor não é lido e não há armamento dos ESCs (pulsos de 1000 µs a partir da linha 126) nem partida dos motores (`loop()`). Não há correção automática, valores padrão nem regravação.
+
+Formato preservado: mesmos 36 endereços, mesma ordem e representação dos bytes, mesma assinatura; o setup, a `convert_receiver_channel()`, o loop de 4 ms, os ganhos, os filtros e os ESCs não foram alterados.
+
+### 4. Justificativa
+
+A verificação roda uma vez, antes do primeiro uso dos parâmetros do receptor (linha 435, em `gyro_signalen()`), e não custa nada no `loop()`. A ordem `low < center < high` é a condição para que a conversão seja proporcional e os dois divisores sejam positivos. O mínimo também precisa ser maior que 0: a ISR do setup guarda pulsos na faixa 0..32767 µs e usa 0 para pulso inválido, que nenhum pulso real mede; um valor negativo só vem de corrupção. Com `0 < low < center < high`, os três valores ficam entre 1 e 32767 e os divisores entre 1 e 32766; como `actual` é limitado a `[low, high]`, as subtrações do numerador ficam entre 0 e 32766, o produto por 500 chega no máximo a 16.383.000 (cabe no `long`), `difference` fica entre 0 e 500 e o retorno entre 1000 e 2000 µs, sem estouro. Não há limites absolutos além de mínimo > 0, porque o setup original não impõe nenhum aos valores gravados (900/2100 µs, na E.1, valem para o pulso instantâneo, antes da calibração). A faixa 1–4 com o bit 7 livre é exatamente o que o setup grava (`trigger` e `+= 0b10000000`). As entradas repetidas são recusadas porque o setup espera usar as quatro (`receiver_check_byte == 0b00001111`, ERROR 6), embora não impeça a repetição de forma estrita; a repetição não causa acesso inválido nem divisão por zero, e é recusada por coerência funcional (duas funções no mesmo stick). Nenhuma configuração que atenda a essas condições (identificações 1–4 distintas e `0 < low < center < high`) é rejeitada, e o comportamento com ela é idêntico ao original.
+
+### 5. Resultados de compilação
+
+Em 27/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8, FQBN `arduino:avr:uno` e `--clean --warnings all`, a partir de cópias em pastas separadas; "antes" = develop `22f1116`.
+
+| Sketch | Flash antes | Flash depois | SRAM global antes | SRAM global depois |
+|---|---:|---:|---:|---:|
+| `YMFC-AL_Flight_controller.ino` | 12410 bytes | 12554 bytes | 501 bytes | 501 bytes |
+| `YMFC-AL_esc_calibrate.ino` | 13444 bytes | 13444 bytes | 1114 bytes | 1114 bytes |
+| `YMFC-AL_setup.ino` | 20680 bytes | 20680 bytes | 532 bytes | 532 bytes |
+| `receiver_diagnostics.ino` | 4590 bytes | 4590 bytes | 506 bytes | 506 bytes |
+
+O Flight ganhou 144 bytes de Flash, ocupados pelo código da nova verificação. A SRAM global não mudou, porque as variáveis da função são locais. A verificação só é chamada no `setup()` (linha 117), e nada foi acrescentado ao `loop()`. Avisos: os mesmos de antes (4 de `new.cpp` em cada sketch e 1 já existente no setup), nenhum novo. Os valores não se somam: são programas distintos.
+
+### 6. Verificações realizadas
+
+Por inspeção do código, contas à mão e compilação; sem placa, sem simulador e sem sketch de teste.
+
+Base: entradas 1–4 com mínimo/centro/máximo = 1000/1500/2000 µs, identificações (endereços 24–27) = 0x01/0x02/0x03/0x04 e assinatura `'J'`, `'M'`, `'B'`. Cada cenário altera só o que está indicado.
+
+| # | Dados simulados | Condição | Comportamento original | Após a mudança | Justificativa |
+|---|---|---|---|---|---|
+| 1 | base | válida | inicia normalmente | idêntico | ordem e faixa corretas; máscara `0b00011110` |
+| 2 | endereço 33 = `'X'` | assinatura inválida | preso na linha 112, LED aceso, pinos 4–7 em LOW | idêntico (a validação nem é alcançada) | verificação original mantida |
+| 3 | todos os bytes 0xFF | EEPROM apagada | preso na linha 112 | idêntico | 0xFF ≠ `'J'`; mesmo que passasse, 0xFF & 0x7F = 127 (fora de 1–4) e low = center = high = −1 seriam recusados (low = −1 ≤ 0) |
+| 4 | entrada 3: 1500/1500/2000 | mínimo = centro | divisão por zero quando actual < center | preso na linha 117 | low >= center |
+| 5 | entrada 1: 1000/2000/2000 | centro = máximo | divisão por zero quando actual > center | preso na linha 117 | center >= high |
+| 6 | entrada 2: 1600/1500/2000 | mínimo > centro | actual < 1500 vira 1000 | preso na linha 117 | low >= center |
+| 7 | entrada 4: 1000/1600/1500 | centro > máximo | actual > 1600 vira 2000 | preso na linha 117 | center >= high |
+| 8 | entrada 1: 2000/1500/1000 | mínimo e máximo trocados | qualquer desvio vira extremo | preso na linha 117 | low >= center |
+| 9 | endereço 24 = 0x00 (ou 0x80) | identificação 0 | lê `receiver_input[0]` (sempre 0) e `eeprom_data[-2]`/`[-1]` | preso na linha 117 | channel < 1 |
+| 10 | endereço 26 = 0x05 (ou 0x09) | acima da faixa | 0x05: `receiver_input[5]`, fora do array; 0x09: & 0b111 = 1, entrada 1 por coincidência | preso na linha 117 | channel > 4 |
+| 11 | endereço 25 = 0x82 | válida com inversão | pitch na entrada 2, invertido | idêntico (bit 7 intacto) | 0x82 & 0x7F = 2 |
+| 12 | endereços 24 e 25 = 0x01 (ou 0x01 e 0x81) | duplicata | roll e pitch no mesmo stick; entrada 2 ignorada | preso na linha 117 | máscara `0b00011010` |
+| 13 | mínimos 1004/1012/1000/1008, centros 1496/1504/1500/1492, máximos 1992/1996/2000/1988, identificações 0x01/0x82/0x03/0x04 | típica do setup | inicia normalmente | idêntico | atende às três condições |
+| 14 | entrada 1: 1499/1500/1501 | limite estreito | divisores = 1, funciona | idêntico (aceita) | sem limite arbitrário |
+| 15 | entrada 1: −32768/1500/2000 (endereços 16–17 = 0x00/0x80) | mínimo negativo | aceita; `center - low` estoura e a metade de baixo do curso vira 1500–1507 | preso na linha 117 | low ≤ 0 |
+| 16 | entrada 1: 0/1500/2000 | mínimo 0 (pulso inválido no setup) | aceita; actual = 1000 dá 1334 | preso na linha 117 | low ≤ 0 |
+| 17 | entrada 1: 4/1500/2000 | mínimo pequeno, positivo | aceita; actual = 1000 dá 1333 | idêntico (aceita) | só 0 e negativos são recusados; sem limite absoluto |
+| 18 | entrada 1: 1000/1500/32767 | máximo espúrio positivo | aceita; actual = 2000 dá 1507 | idêntico (aceita) | sem estouro: 31267 × 500 = 15.633.500 cabe no `long`; conversão comprimida |
+
+Nas contas, `low`, `center` e `high` foram remontados com as expressões do código; com `int` de 16 bits, `(0xFF << 8) | 0xFF` dá −1 (cenário 3). Nos cenários 4 e 5, `actual` é limitado a `low` (ou a `high`), e a conta fica 0/0. No cenário 15, `(0x80 << 8) | 0x00` dá −32768; `center - low` = 1500 + 32768 = 34268 não cabe no `int` e, na prática, vira 34268 − 65536 = −31268; com actual = 1000, `difference` = 250000 / −31268 = −7 (divisão truncada) e o retorno é 1500 − (−7) = 1507. No cenário 16, actual = 1000 dá 250000 / 1500 = 166 e retorno 1334; no 17, 250000 / 1496 = 167 e retorno 1333; no 18, actual = 2000 dá 250000 / 31267 = 7 e retorno 1507.
+
+A compilação só mostra que o código é aceito e o uso de memória; os resultados da tabela são previstos pela análise, não observados.
+
+### 7. Limitações
+
+- Detecta só incoerências; uma corrupção que mantenha `low < center < high` e identificações distintas (por exemplo, um centro deslocado) passa. Não há CRC, e nem todas as corrupções são detectadas.
+- Não avalia a qualidade da calibração (ex.: throttle centralizado no mínimo, mas com `low < center`), nem valores fisicamente implausíveis: não há limites absolutos além de mínimo > 0, e mínimos/máximos espúrios ainda positivos passam, com conversão comprimida (cenários 17 e 18).
+- Com a assinatura de uma gravação anterior e dados misturados (queda de alimentação durante a gravação do setup ou ERROR 5), a H.3 só detecta a mistura se ela for incoerente.
+- Os endereços 28–32 (eixos, tipo e endereço do giroscópio) não foram validados; a linha 116 original continua sem efeito.
+- O erro aparece só como o LED aceso fixo, igual ao da assinatura e ao da falha do giroscópio (linhas 630–631); sem Serial, não se distingue a causa.
+- A verificação roda só na inicialização; a cópia em SRAM não é conferida durante o voo.
+- O `YMFC-AL_esc_calibrate.ino` tem a mesma conversão sem validação e não foi alterado (fora do escopo).
+- Não houve teste em hardware.
