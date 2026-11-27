@@ -239,12 +239,7 @@ void loop(){
     gyro_angles_set = true;                                                 //Set the IMU started flag.
 
     //Reset the PID controllers for a bumpless start.
-    pid_i_mem_roll = 0;
-    pid_last_roll_d_error = 0;
-    pid_i_mem_pitch = 0;
-    pid_last_pitch_d_error = 0;
-    pid_i_mem_yaw = 0;
-    pid_last_yaw_d_error = 0;
+    reset_pid();
   }
   //Stopping the motors: throttle low and yaw right.
   if(start == 2 && receiver_input_channel_3 < 1050 && receiver_input_channel_4 > 1950)start = 0;
@@ -513,6 +508,21 @@ void calculate_pid(){
   else if(pid_output_yaw < pid_max_yaw * -1)pid_output_yaw = pid_max_yaw * -1;
 
   pid_last_yaw_d_error = pid_error_temp;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Subrotina para reinicializar os controladores PID
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Reune as atribuicoes que ja existiam no loop(), executadas na partida dos motores.
+//Zera a memoria integral e o ultimo erro usado no termo derivativo dos tres eixos.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void reset_pid(){
+  pid_i_mem_roll = 0;
+  pid_last_roll_d_error = 0;
+  pid_i_mem_pitch = 0;
+  pid_last_pitch_d_error = 0;
+  pid_i_mem_yaw = 0;
+  pid_last_yaw_d_error = 0;
 }
 
 //This part converts the actual receiver signals to a standardized 1000 – 1500 – 2000 microsecond value.
