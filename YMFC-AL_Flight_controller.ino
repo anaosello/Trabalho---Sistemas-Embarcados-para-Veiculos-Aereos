@@ -17,6 +17,7 @@
 
 #include <Wire.h>                          //Include the Wire.h library so we can communicate with the gyro.
 #include <EEPROM.h>                        //Include the EEPROM.h library so we can store information onto the EEPROM
+#include <util/atomic.h>                   //Inclui a util/atomic.h para usar ATOMIC_BLOCK (secao critica na leitura do receptor)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //PID gain and limit settings
@@ -68,7 +69,7 @@ const float BATTERY_FILTER_ALPHA = 0.08f; // Peso da nova medição no filtro
 float battery_voltage_filtered = 0.0f; // Armazena a estimativa da tensão com precisão fracionária
 
 int cal_int, start, gyro_address;
-int receiver_input[5];
+volatile int receiver_input[5]; // Escrito pela ISR(PCINT0_vect) e lido em convert_receiver_channel()
 int temperature;
 int acc_axis[4], gyro_axis[4];
 float roll_level_adjust, pitch_level_adjust;
@@ -544,7 +545,9 @@ int convert_receiver_channel(byte function){
   if(eeprom_data[function + 23] & 0b10000000)reverse = 1;                      //Reverse channel when most significant bit is set
   else reverse = 0;                                                            //If the most significant is not set there is no reverse
 
-  actual = receiver_input[channel];                                            //Read the actual receiver value for the corresponding function
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE){                                           //Secao critica: a ISR(PCINT0_vect) nao interrompe a leitura dos 2 bytes
+    actual = receiver_input[channel];                                          //Read the actual receiver value for the corresponding function
+  }                                                                            //Fim da secao critica: o SREG (bit I) volta ao estado anterior
   low = (eeprom_data[channel * 2 + 15] << 8) | eeprom_data[channel * 2 + 14];  //Store the low value for the specific receiver input channel
   center = (eeprom_data[channel * 2 - 1] << 8) | eeprom_data[channel * 2 - 2]; //Store the center value for the specific receiver input channel
   high = (eeprom_data[channel * 2 + 7] << 8) | eeprom_data[channel * 2 + 6];   //Store the high value for the specific receiver input channel
