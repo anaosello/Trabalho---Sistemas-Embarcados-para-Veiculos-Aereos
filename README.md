@@ -854,3 +854,83 @@ Verificações conceituais, descrevendo o comportamento esperado pela implementa
 ### 7. Limitações
 
 Não houve gravação nem leitura em hardware, nem contagem de ciclos de escrita. `EEPROM.update()` acrescenta uma leitura por byte durante a gravação da configuração, apenas no setup. A alteração não valida a coerência dos parâmetros gravados nem protege contra corrupção da EEPROM por queda de alimentação.
+
+---
+
+## Melhoria AO.2 — Tratamento de erros I²C
+
+**Responsável:** AO (identificação completa a confirmar)
+
+**Branch:** `feat/i2c-error-handling`
+
+**Arquivos modificados:** `YMFC-AL_setup.ino` e `README.md`.
+
+### 1. Problema identificado
+
+No `YMFC-AL_setup.ino`, nenhum valor de retorno da comunicação I²C com o giroscópio era usado: `Wire.endTransmission()` e `Wire.requestFrom()` informam se a transação deu certo, mas o resultado era ignorado.
+Depois de cada leitura havia uma espera `while(Wire.available() < N);` (seis no total, em `start_gyro()` e `gyro_signalen()`). Como `available()` não muda depois que `requestFrom()` retorna, essa espera termina na hora (dados completos) ou nunca (faltou byte).
+Além disso, o timeout interno da biblioteca Wire vem desligado por padrão; se o barramento travar, a própria biblioteca pode ficar presa. Nos dois casos, o setup parava sem nenhuma mensagem no monitor serial.
+Em `search_gyro()` a espera já tinha limite de 100 ms (`timer`) e um sensor ausente já terminava em ERROR 3; ali a mudança é de consistência e evita essas esperas, não corrige um travamento.
+
+### 2. Conteúdo das aulas relacionado
+
+- Aula 0x0002 (Revisão de Linguagem C), pp. 8–9: condicionais e `if/else` para variar o fluxo conforme uma condição; p. 18: o slide apresenta o `while` com a "condição para permanência no laço". Daí se conclui que uma condição que nunca muda gera um laço sem fim.
+- Aula 0x0002, p. 15: laço `for` e o comentário "para sair da repetição é necessário break", usado para interromper a calibração; p. 19: operadores lógicos `==` e `!=`, usados nas conferências.
+- Aula 0x0002, pp. 28–29: funções podem "retornar resultados para interface com o restante do programa"; no exemplo `void Proximo`, `return;` encerra uma função sem retorno. P. 30: a função principal retorna "0 para ausência de erro", a mesma convenção de `endTransmission()` e da variável `error`.
+- Sistemas Embarcados (EESC, Ago/2026), p. 25: I2C aparece apenas listado entre as comunicações com fio; p. 18: I2C aparece listado entre as portas de uma placa com MCU. P. 37: no exemplo de aviônica sobre a escolha do sistema operacional, "crashes are not acceptable in flight" (o setup roda em solo; a citação é só motivação).
+- Analogia (CAN e I²C são protocolos diferentes): em Protocolos CAN, p. 26, no campo ACK o receptor que recebeu certo sobrescreve o bit com dominante; p. 29, o "ACK error" é detectado pelo transmissor quando ninguém confirma. O ACK/NACK do I²C não é apresentado nas aulas: que ele tenha papel parecido e apareça nos códigos 2 e 3 de `endTransmission()` vem da documentação e do código da Wire (conhecimento externo, abaixo).
+
+Conhecimento externo às aulas: biblioteca Wire do core `arduino:avr` 1.8.8. Em `utility/twi.c`, `twi_writeTo()` (base de `endTransmission()`) retorna 0 (sucesso), 1 (dados longos demais), 2 (NACK no endereço), 3 (NACK no dado), 4 (outro erro) ou 5 (timeout); `twi_timeout_us = 0ul` desliga o timeout por padrão. Em `Wire.cpp`, `requestFrom()` retorna quantos bytes foram recebidos (0 em NACK ou timeout) e `available()` só calcula os bytes que restam no buffer. Em `Wire.h`, `setWireTimeout(uint32_t timeout = 25000, bool reset_with_timeout = false)`; o comentário de `Wire.cpp` indica 25 ms como valor típico.
+
+### 3. Alteração realizada
+
+- `setup()`: `Wire.setWireTimeout(25000, false);` logo após `Wire.begin();`.
+- `search_gyro()`: se `endTransmission()` não retornar 0 ou `requestFrom()` não trouxer 1 byte, a função retorna 0, e o `loop()` tenta o próximo endereço. Não é erro: se nenhum endereço responder, o ERROR 3 existente interrompe o setup. A espera com `timer` ficou redundante após a conferência do `requestFrom()`, mas foi mantida para não sobrepor a melhoria H.2.
+- Nova função `gyro_i2c_error()`: imprime `I2C communication with the gyro failed!!! (ERROR 9)` e faz `error = 1`. ERROR 9 é um código novo (1 a 8 já existiam).
+- `start_gyro()`: as 8 chamadas de `endTransmission()` e as 4 de `requestFrom(address, 1)` passaram a ser conferidas; em falha, chama `gyro_i2c_error()` e retorna. As quatro esperas `while(Wire.available() < 1);` foram removidas; um único comentário explica que `requestFrom()` é bloqueante e devolve quantos bytes chegaram.
+- `gyro_signalen()`: mesma conferência nas 2 transmissões e nas 2 leituras de 6 bytes; as duas esperas `while(Wire.available() < 6);` foram removidas.
+- Calibração: `if(error == 1)break;` logo após `gyro_signalen()`, antes de somar a leitura. O bloco `if(error == 0)` foi dividido em dois blocos seguidos, no mesmo nível, como as demais etapas do `loop()`: o primeiro faz as 2000 leituras e o segundo calcula e mostra os offsets e configura os eixos.
+- `check_gyro_axes()`: `if(error == 1)return;` após as duas chamadas de `gyro_signalen()`.
+
+Registradores, valores escritos, ordem das operações, mensagens existentes e a gravação na EEPROM não foram alterados.
+
+### 4. Justificativa
+
+Uma espera sem limite deixa o setup parado sem explicar o motivo. Conferir o retorno de cada operação e a quantidade de bytes recebidos mostra a falha na hora e impede o uso de dados incompletos.
+Só conferir retornos não basta: se o barramento travar, a Wire nem chega a retornar. O timeout limita cada espera interna da biblioteca e faz a função retornar com erro, que então é conferido.
+Na busca, um endereço sem resposta é esperado (o sensor pode estar em outro endereço); depois que o giroscópio foi encontrado, qualquer falha é impeditiva. Nesse caso, `error = 1` faz o `loop()` pular as etapas seguintes (todas sob `if(error == 0)`), inclusive a gravação na EEPROM, e mostrar a mensagem de aborto.
+25 ms é o valor sugerido pela própria biblioteca e vale para cada espera interna da Wire, separadamente, e não para a transação inteira. Em operação normal, uma transação completa a 400 kHz dura bem menos que isso (uma leitura de 6 bytes, com o endereço, ocupa cerca de 63 bits de 2,5 µs, perto de 0,16 ms), e nenhuma espera se aproxima do limite. Em uma falha, a operação pode passar por mais de uma espera; por isso a demora total até o erro pode passar de 25 ms (algumas dezenas de milissegundos), mas continua limitada. `false` mantém o comportamento simples: sem reinicializar o hardware TWI, pois não há recuperação automática.
+
+### 5. Resultados de compilação
+
+Em 26/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os sketches foram compilados a partir de cópias em pastas separadas.
+
+| `YMFC-AL_setup.ino` | Referência da develop (`dea7bd1`) | Versão modificada |
+|---|---:|---:|
+| Flash utilizada | 20608 bytes | 20686 bytes |
+| SRAM global utilizada | 532 bytes | 532 bytes |
+
+O setup passou a ocupar 78 bytes a mais de Flash, sem aumento de SRAM global (a nova mensagem usa `F()`). `YMFC-AL_Flight_controller.ino` e `YMFC-AL_esc_calibrate.ino` não mudaram e compilaram com os mesmos valores da referência (12548/501 e 13126/1106 bytes de Flash/SRAM global).
+Com `--warnings all`, o setup apresentou os mesmos 5 avisos antes e depois: 4 de `new.cpp` do core e 1 já existente em `wait_for_receiver()` (`'now' may be used uninitialized`). Nenhum aviso novo.
+
+### 6. Verificações realizadas
+
+Análise conceitual, por inspeção do código e compilação, sem observação em hardware:
+
+1. Sensor presente e funcionamento normal: as conferências passam, a busca identifica o sensor como antes e as mesmas operações são feitas na mesma ordem; as esperas removidas já terminavam imediatamente nesse caso.
+2. Sensor ausente: todos os endereços retornam NACK, `search_gyro()` retorna 0 e o ERROR 3 existente interrompe o setup, como antes, mas sem as esperas de 100 ms por endereço.
+3. Endereço sem resposta na busca (ex.: MPU-6050 em 0x69): a tentativa em 0x68 retorna 0 e a busca segue para 0x69, sem ERROR 9.
+4. Falha de transmissão após a busca (`endTransmission()` de 1 a 5): ERROR 9.
+5. Menos bytes que o pedido, ou nenhum: `requestFrom()` retorna menos que N (0, se nada chegou) e gera ERROR 9 sem ler dados incompletos; antes, o `while` nunca terminaria.
+6. Bloqueio interno do barramento: cada espera interna da Wire é interrompida após cerca de 25 ms; depois de uma ou mais dessas esperas, a operação retorna com erro e a falha vira ERROR 9; sem o timeout, nenhuma conferência resolveria. Se o bloqueio ocorrer durante a busca, o resultado é o ERROR 3.
+7. Interrupção após o erro: em `start_gyro()`, na calibração e em `check_gyro_axes()`, a função para na primeira falha; a mensagem não se repete e nenhuma leitura antiga é somada ou integrada.
+8. Nenhuma gravação inválida: a EEPROM só é gravada dentro de `if(error == 0)`, e `error` nunca volta a 0.
+
+### 7. Limitações
+
+- Não houve teste em hardware nem simulação de falhas no barramento.
+- Um bloqueio do barramento durante a busca aparece como ERROR 3 ("No gyro device found"), e não como ERROR 9.
+- O ERROR 9 não informa qual operação falhou, e os valores lidos dos registradores não são comparados com os esperados.
+- Não há recuperação nem nova tentativa: o setup é interrompido.
+- O limite de 25 ms vale para cada espera interna da Wire, não para a transação inteira; em caso de falha, a demora até a mensagem de erro pode somar algumas dezenas de milissegundos. O timeout só foi configurado no setup.
+- `YMFC-AL_Flight_controller.ino` e `YMFC-AL_esc_calibrate.ino` continuam com esperas I²C sem timeout; as comparações temporais com `millis()` ficam para a melhoria H.2.
