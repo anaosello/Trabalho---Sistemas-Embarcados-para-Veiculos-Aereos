@@ -732,3 +732,62 @@ o setup previamente gravado na EEPROM e o conjunto imóvel:
 A correção elimina a reutilização dos offsets como soma inicial.
 Ela não detecta movimento durante a calibração nem falhas de comunicação
 I²C; o conjunto deve permanecer imóvel durante a aquisição.
+
+---
+
+## Melhoria AP.1 — Modularização do reset do PID
+
+**Responsável:** AP (identificação completa a confirmar)
+
+**Branch:** `refactor/pid-reset`
+
+**Arquivos modificados:** `YMFC-AL_Flight_controller.ino` e `README.md`.
+
+### 1. Problema identificado
+
+O firmware original já reinicializa o PID ao armar os motores, mas as seis atribuições ficavam soltas no `if` de partida do `loop()`, junto da inicialização dos ângulos.
+Como `calculate_pid()` é chamada em todo ciclo, inclusive com os motores parados, a memória integral acumula antes da partida; o reset evita levar esse valor aos motores na arrancada (comentário original "bumpless start").
+
+### 2. Conteúdo das aulas relacionado
+
+- Aula 0x0002, p. 28: função é uma rotina com identificador próprio, chamada no corpo principal, que "permite repetição de operações sem reescrita de código".
+- Aula 0x0002, p. 29: o exemplo `Proximo` é uma função `void`, sem retorno.
+- Aula 0x0002, p. 31: declaração prévia de uma função auxiliar que é definida depois de `main`.
+- Aula 0x0001, p. 22: linguagem estruturada, com recursos de funções, condicionais e repetições.
+
+Conhecimento externo às aulas (processo de compilação do Arduino): no `.ino`, a declaração prévia não é necessária, pois o pré-processamento gera os protótipos; o próprio sketch já chama `calculate_pid()`, definida após `loop()`.
+
+### 3. Alteração realizada
+
+Foi criada a função `void reset_pid()`, sem parâmetros e sem retorno, logo após `calculate_pid()`. As atribuições `pid_i_mem_roll = 0;`, `pid_last_roll_d_error = 0;`, `pid_i_mem_pitch = 0;`, `pid_last_pitch_d_error = 0;`, `pid_i_mem_yaw = 0;` e `pid_last_yaw_d_error = 0;` foram transferidas sem mudança e na mesma ordem.
+No `loop()`, o bloco foi substituído por `reset_pid();` no mesmo ponto, após `gyro_angles_set = true;`, mantendo o comentário original.
+Nenhuma variável foi criada; o código de ganhos, limites, equações, condições, ESCs e temporização não foi alterado.
+
+### 4. Justificativa
+
+O `loop()` passa a mostrar a etapa pelo nome e o reset fica agrupado junto à rotina do PID; se necessário, ele pode ser chamado de novo sem reescrever as linhas (Aula 0x0002, p. 28).
+O mecanismo já existia: trata-se de uma refatoração, sem novo mecanismo de controle e sem ganho de desempenho ou de estabilidade.
+
+### 5. Resultados de compilação
+
+Em 26/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os sketches foram compilados a partir de cópias em pastas separadas.
+
+| Recurso | Referência da develop | Versão modificada |
+|---|---:|---:|
+| Flash utilizada | 12548 bytes | 12548 bytes |
+| SRAM global utilizada | 501 bytes | 501 bytes |
+| SRAM restante para variáveis locais | 1547 bytes | 1547 bytes |
+
+`YMFC-AL_setup.ino` e `YMFC-AL_esc_calibrate.ino` não mudaram e compilaram com os mesmos valores da referência (20572/532 e 13126/1106 bytes de Flash/SRAM global).
+
+### 6. Verificações realizadas
+
+A comparação do diff mostra que as seis linhas removidas do `loop()` são iguais às seis do corpo de `reset_pid()`, na mesma ordem.
+A função é chamada uma única vez, sob a mesma condição e no mesmo ponto da mesma iteração; portanto, as mesmas variáveis são zeradas no mesmo ponto do fluxo de execução.
+A verificação foi feita por inspeção do código e compilação.
+
+### 7. Limitações
+
+Refatoração sem mudança de comportamento esperada; não foi testada em hardware.
+O comportamento original no desarme, sem reset do PID, foi mantido de propósito.
+Não houve medição experimental do tempo de execução nem comparação dos binários gerados.
