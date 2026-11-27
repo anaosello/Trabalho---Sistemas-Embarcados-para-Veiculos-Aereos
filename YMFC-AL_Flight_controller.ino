@@ -17,6 +17,7 @@
 
 #include <Wire.h>                          //Include the Wire.h library so we can communicate with the gyro.
 #include <EEPROM.h>                        //Include the EEPROM.h library so we can store information onto the EEPROM
+#include <util/atomic.h>                   //Inclui a util/atomic.h para usar ATOMIC_BLOCK (secao critica na leitura do receptor)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //PID gain and limit settings
@@ -48,8 +49,27 @@ volatile int receiver_input_channel_1, receiver_input_channel_2, receiver_input_
 int counter_channel_1, counter_channel_2, counter_channel_3, counter_channel_4, loop_counter;
 int esc_1, esc_2, esc_3, esc_4;
 int throttle, battery_voltage;
+
+// Monitoramento da tensao da bateria
+// Valores em centesimos de volt (LiPo 3S)
+const int BATTERY_LOW_THRESHOLD = 1050; // Limite para ativar o alerta
+const int BATTERY_RECOVERY_THRESHOLD = 1080; //Limite para desativar o alerta
+
+// Estados dos indicadores de falha
+bool low_battery = false; // Armazena o estado do alerta de bateria
+bool timing_fault = false; // Armazena a ocorrência de falha de temporização
+
+// Parametros de conversao e filtragem da bateria
+const float BATTERY_ADC_GAIN = 1.2317f; // Fator de conversão da leitura analógica
+const int BATTERY_ADC_OFFSET = 65; // Compensação original associada ao diodo
+const float BATTERY_FILTER_ALPHA = 0.08f; // Peso da nova medição no filtro
+
+// Tensao filtrada com preservacao das casas decimais
+// Unidade: centesimos de volt
+float battery_voltage_filtered = 0.0f; // Armazena a estimativa da tensão com precisão fracionária
+
 int cal_int, start, gyro_address;
-int receiver_input[5];
+volatile int receiver_input[5]; // Escrito pela ISR(PCINT0_vect) e lido em convert_receiver_channel()
 int temperature;
 int acc_axis[4], gyro_axis[4];
 float roll_level_adjust, pitch_level_adjust;
@@ -90,6 +110,11 @@ void setup(){
 
   //Check the EEPROM signature to make sure that the setup program is executed.
   while(eeprom_data[33] != 'J' || eeprom_data[34] != 'M' || eeprom_data[35] != 'B')delay(10);
+
+  //A assinatura so mostra que o setup ja a gravou alguma vez; nao garante que a ultima gravacao terminou nem que os dados sejam coerentes.
+  //Configuracao do receptor invalida: fica neste laco, como no da assinatura (LED do pino 12 aceso,
+  //pinos 4 a 7 dos ESCs em LOW e sem pulsos), antes do primeiro uso dos parametros e do armamento.
+  while(!receiver_settings_valid())delay(10);
 
   //The flight controller needs the MPU-6050 with gyro and accelerometer
   //If setup is completed without MPU-6050 stop the flight controller program  
@@ -145,15 +170,20 @@ void setup(){
   }
   start = 0;                                                                //Set start back to 0.
 
-  //Load the battery voltage to the battery_voltage variable.
-  //65 is the voltage compensation for the diode.
-  //12.6V equals ~5V @ Analog 0.
-  //12.6V equals 1023 analogRead(0).
-  //1260 / 1023 = 1.2317.
-  //The variable battery_voltage holds 1050 if the battery voltage is 10.5V.
-  battery_voltage = (analogRead(0) + 65) * 1.2317;
+  
+  // Realiza a primeira leitura da tensao da bateria
+  int initial_battery_adc = analogRead(A0);
 
-  loop_timer = micros();                                                    //Set the timer for the next loop.
+  // Inicializa a variavel original utilizada na compensacao
+  battery_voltage = (initial_battery_adc + 65) * 1.2317;
+
+  // Inicializa o novo filtro diretamente com a tensao medida
+  battery_voltage_filtered =
+      (initial_battery_adc + BATTERY_ADC_OFFSET)
+      * BATTERY_ADC_GAIN;
+
+
+    loop_timer = micros();                                                    //Set the timer for the next loop.
 
   //When everything is done, turn off the led.
   digitalWrite(12,LOW);                                                     //Turn off the warning led.
@@ -215,22 +245,15 @@ void loop(){
     gyro_angles_set = true;                                                 //Set the IMU started flag.
 
     //Reset the PID controllers for a bumpless start.
-    pid_i_mem_roll = 0;
-    pid_last_roll_d_error = 0;
-    pid_i_mem_pitch = 0;
-    pid_last_pitch_d_error = 0;
-    pid_i_mem_yaw = 0;
-    pid_last_yaw_d_error = 0;
+    reset_pid();
   }
   //Stopping the motors: throttle low and yaw right.
   if(start == 2 && receiver_input_channel_3 < 1050 && receiver_input_channel_4 > 1950)start = 0;
 
   //The PID set point in degrees per second is determined by the roll receiver input.
   //In the case of deviding by 3 the max roll rate is aprox 164 degrees per second ( (500-8)/3 = 164d/s ).
-  pid_roll_setpoint = 0;
   //We need a little dead band of 16us for better results.
-  if(receiver_input_channel_1 > 1508)pid_roll_setpoint = receiver_input_channel_1 - 1508;
-  else if(receiver_input_channel_1 < 1492)pid_roll_setpoint = receiver_input_channel_1 - 1492;
+  pid_roll_setpoint = apply_dead_band(receiver_input_channel_1);            //Retorna 0 dentro da zona morta
 
   pid_roll_setpoint -= roll_level_adjust;                                   //Subtract the angle correction from the standardized receiver roll input value.
   pid_roll_setpoint /= 3.0;                                                 //Divide the setpoint for the PID roll controller by 3 to get angles in degrees.
@@ -238,10 +261,8 @@ void loop(){
 
   //The PID set point in degrees per second is determined by the pitch receiver input.
   //In the case of deviding by 3 the max pitch rate is aprox 164 degrees per second ( (500-8)/3 = 164d/s ).
-  pid_pitch_setpoint = 0;
   //We need a little dead band of 16us for better results.
-  if(receiver_input_channel_2 > 1508)pid_pitch_setpoint = receiver_input_channel_2 - 1508;
-  else if(receiver_input_channel_2 < 1492)pid_pitch_setpoint = receiver_input_channel_2 - 1492;
+  pid_pitch_setpoint = apply_dead_band(receiver_input_channel_2);           //Retorna 0 dentro da zona morta
 
   pid_pitch_setpoint -= pitch_level_adjust;                                  //Subtract the angle correction from the standardized receiver pitch input value.
   pid_pitch_setpoint /= 3.0;                                                 //Divide the setpoint for the PID pitch controller by 3 to get angles in degrees.
@@ -251,20 +272,16 @@ void loop(){
   pid_yaw_setpoint = 0;
   //We need a little dead band of 16us for better results.
   if(receiver_input_channel_3 > 1050){ //Do not yaw when turning off the motors.
-    if(receiver_input_channel_4 > 1508)pid_yaw_setpoint = (receiver_input_channel_4 - 1508)/3.0;
-    else if(receiver_input_channel_4 < 1492)pid_yaw_setpoint = (receiver_input_channel_4 - 1492)/3.0;
+    pid_yaw_setpoint = apply_dead_band(receiver_input_channel_4)/3.0;       //Retorna 0 dentro da zona morta
   }
   
   calculate_pid();                                                            //PID inputs are known. So we can calculate the pid output.
 
-  //The battery voltage is needed for compensation.
-  //A complementary filter is used to reduce noise.
-  //0.09853 = 0.08 * 1.2317.
-  battery_voltage = battery_voltage * 0.92 + (analogRead(0) + 65) * 0.09853;
+  // Atualiza a medicao e a filtragem da tensao da bateria
+  update_battery_voltage();
 
-  //Turn on the led if battery voltage is to low.
-  if(battery_voltage < 1000 && battery_voltage > 600)digitalWrite(12, HIGH);
-
+  // Atualiza o alerta de bateria utilizando histerese
+  update_battery_warning();
 
   throttle = receiver_input_channel_3;                                      //We need the throttle signal as a base signal.
 
@@ -312,7 +329,19 @@ void loop(){
   //the Q&A page: 
   //! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !
     
-  if(micros() - loop_timer > 4050)digitalWrite(12, HIGH);                   //Turn on the LED if the loop time exceeds 4050us.
+  
+  // Atualiza o indicador combinado de falhas.
+  // Uma falha de temporizacao permanece registrada ate reiniciar.
+  digitalWrite(12, low_battery || timing_fault);
+
+  // Verifica se o tempo de processamento excedeu o limite
+  if(micros() - loop_timer > 4050){
+
+      timing_fault = true;
+
+      digitalWrite(12, HIGH);
+  }
+
   
   //All the information for controlling the motor's is available.
   //The refresh rate is 250Hz. That means the esc's need there pulse every 4ms.
@@ -482,6 +511,34 @@ void calculate_pid(){
   pid_last_yaw_d_error = pid_error_temp;
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Subrotina para reinicializar os controladores PID
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Reune as atribuicoes que ja existiam no loop(), executadas na partida dos motores.
+//Zera a memoria integral e o ultimo erro usado no termo derivativo dos tres eixos.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void reset_pid(){
+  pid_i_mem_roll = 0;
+  pid_last_roll_d_error = 0;
+  pid_i_mem_pitch = 0;
+  pid_last_pitch_d_error = 0;
+  pid_i_mem_yaw = 0;
+  pid_last_yaw_d_error = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Subrotina para aplicar a zona morta aos comandos do receptor
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Reune o calculo que se repetia para roll, pitch e yaw no loop().
+//Recebe o pulso padronizado (1000 - 2000us) e retorna a distancia ate a zona morta (1492 - 1508us).
+//Dentro da zona morta, inclusive nos limites, retorna 0.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+int apply_dead_band(int pulse){
+  if(pulse > 1508)return pulse - 1508;                                      //Acima da zona morta: desconta o limite superior
+  else if(pulse < 1492)return pulse - 1492;                                 //Abaixo da zona morta: desconta o limite inferior
+  return 0;                                                                 //Dentro da zona morta: comando nulo
+}
+
 //This part converts the actual receiver signals to a standardized 1000 – 1500 – 2000 microsecond value.
 //The stored data in the EEPROM is used.
 int convert_receiver_channel(byte function){
@@ -493,7 +550,9 @@ int convert_receiver_channel(byte function){
   if(eeprom_data[function + 23] & 0b10000000)reverse = 1;                      //Reverse channel when most significant bit is set
   else reverse = 0;                                                            //If the most significant is not set there is no reverse
 
-  actual = receiver_input[channel];                                            //Read the actual receiver value for the corresponding function
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE){                                           //Secao critica: a ISR(PCINT0_vect) nao interrompe a leitura dos 2 bytes
+    actual = receiver_input[channel];                                          //Read the actual receiver value for the corresponding function
+  }                                                                            //Fim da secao critica: o SREG (bit I) volta ao estado anterior
   low = (eeprom_data[channel * 2 + 15] << 8) | eeprom_data[channel * 2 + 14];  //Store the low value for the specific receiver input channel
   center = (eeprom_data[channel * 2 - 1] << 8) | eeprom_data[channel * 2 - 2]; //Store the center value for the specific receiver input channel
   high = (eeprom_data[channel * 2 + 7] << 8) | eeprom_data[channel * 2 + 6];   //Store the high value for the specific receiver input channel
@@ -511,6 +570,36 @@ int convert_receiver_channel(byte function){
     else return 1500 + difference;                                             //If the channel is not reversed
   }
   else return 1500;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Subrotina para validar as configuracoes do receptor gravadas na EEPROM
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Confere na copia eeprom_data[] os enderecos 0 a 27, que convert_receiver_channel() usa como indice e como divisor.
+//Enderecos 24 a 27: sem o bit 7 (inversao), a entrada deve ser 1, 2, 3 ou 4, os valores gravados pelo setup.
+//As quatro funcoes devem usar entradas diferentes: a mascara precisa ficar com os bits 1 a 4 ligados (0b00011110).
+//Enderecos 0 a 23: em cada entrada, 0 < low < center < high; assim (center - low) e (high - center) ficam entre 1 e 32766, sem zero nem estouro do int.
+//So le os dados: nao grava a EEPROM, nao muda o formato e nao corrige valores. Executada apenas no setup().
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+bool receiver_settings_valid(){
+  byte function, channel;
+  byte used_channels = 0;                                                      //Bit n ligado = entrada n ja usada por uma funcao
+  int low, center, high;
+
+  for(function = 1; function <= 4; function++){                                //Roll, pitch, throttle e yaw (enderecos 24 a 27)
+    channel = eeprom_data[function + 23] & 0b01111111;                         //Ignora so o bit 7 (inversao), que convert_receiver_channel() continua usando
+    if(channel < 1 || channel > 4)return false;                                //Entrada fora da faixa gravada pelo setup
+    used_channels |= 1 << channel;                                             //Marca a entrada usada por esta funcao
+  }
+  if(used_channels != 0b00011110)return false;                                 //Entrada repetida: uma das quatro ficou sem uso
+
+  for(channel = 1; channel <= 4; channel++){                                   //Calibracao das quatro entradas (enderecos 0 a 23)
+    low = (eeprom_data[channel * 2 + 15] << 8) | eeprom_data[channel * 2 + 14];  //Mesmos indices de convert_receiver_channel()
+    center = (eeprom_data[channel * 2 - 1] << 8) | eeprom_data[channel * 2 - 2];
+    high = (eeprom_data[channel * 2 + 7] << 8) | eeprom_data[channel * 2 + 6];
+    if(low <= 0 || low >= center || center >= high)return false;               //0 = pulso invalido na ISR do setup; negativo = dado corrompido; ordem incoerente ou divisor nulo
+  }
+  return true;                                                                 //Configuracao do receptor coerente
 }
 
 void set_gyro_registers(){
@@ -549,3 +638,52 @@ void set_gyro_registers(){
 
   }  
 }
+
+
+
+// Atualiza o estado do alerta de bateria utilizando histerese
+void update_battery_warning(){
+
+    // Ativa o alerta quando a tensao filtrada
+    // atinge o limite inferior
+    if(battery_voltage_filtered <= BATTERY_LOW_THRESHOLD){
+
+        low_battery = true;
+    }
+
+    // Desativa o alerta somente apos a tensao
+    // filtrada atingir o limite superior
+    else if(battery_voltage_filtered >= BATTERY_RECOVERY_THRESHOLD){
+
+        low_battery = false;
+    }
+
+    // Entre os dois limites, o estado anterior e mantido
+}
+
+
+
+// Realiza a leitura e a filtragem digital da bateria
+void update_battery_voltage(){
+
+    // Uma unica leitura do conversor analogico-digital
+    int battery_adc = analogRead(A0);
+
+    // Preserva o filtro original utilizado na compensacao
+    // da tensao aplicada aos motores
+    battery_voltage =
+        battery_voltage * 0.92
+        + (battery_adc + 65) * 0.09853;
+
+    // Converte a leitura do ADC para centesimos de volt
+    float measured_voltage =
+        (battery_adc + BATTERY_ADC_OFFSET)
+        * BATTERY_ADC_GAIN;
+
+    // Filtro passa-baixas digital de primeira ordem
+    // Preserva as casas decimais entre as iteracoes
+    battery_voltage_filtered +=
+        BATTERY_FILTER_ALPHA *
+        (measured_voltage - battery_voltage_filtered);
+}
+

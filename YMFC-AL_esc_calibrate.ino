@@ -233,6 +233,16 @@ void loop(){
   if(data == 'a'){
 
     if(cal_int != 2000){
+      //Discard previous offsets before accumulating a new set of raw samples.
+      gyro_axis_cal[1] = 0.0;
+      gyro_axis_cal[2] = 0.0;
+      gyro_axis_cal[3] = 0.0;
+
+      //Initialize the angle estimate again after each calibration.
+      angle_pitch = 0.0;
+      angle_roll = 0.0;
+      first_angle = false;
+
       Serial.print("Calibrating the gyro");
       //Let's take multiple gyro data samples so we can determine the average gyro offset (calibration).
       for (cal_int = 0; cal_int < 2000 ; cal_int ++){                                   //Take 2000 readings for calibration.
@@ -275,20 +285,29 @@ void loop(){
       angle_roll += angle_pitch * sin(gyro_yaw * 0.000001066);                         //If the IMU has yawed transfer the pitch angle to the roll angel.
 
       //Accelerometer angle calculations
-      acc_total_vector[0] = sqrt((acc_x*acc_x)+(acc_y*acc_y)+(acc_z*acc_z));           //Calculate the total accelerometer vector.
+      //Cada quadrado cabe em long (no maximo 32768^2 = 1 073 741 824), mas a soma dos tres pode chegar a
+      //3 221 225 472 e passar de 2 147 483 647; somada em unsigned long (ate 4 294 967 295) ela cabe.
+      acc_total_vector[0] = sqrt((unsigned long)(acc_x*acc_x)+(unsigned long)(acc_y*acc_y)+(unsigned long)(acc_z*acc_z));  //Calculate the total accelerometer vector.
+
+      //Mesma protecao do Flight controller: |acc| < vetor total garante denominador maior que zero
+      //e argumento do asin entre -1 e +1, sem os extremos. Eixo invalido nao recebe novo angulo do acelerometro neste ciclo.
+      boolean pitch_acc_valid = abs(acc_y) < acc_total_vector[0];                      //Pitch do acelerometro pode ser calculado.
+      boolean roll_acc_valid = abs(acc_x) < acc_total_vector[0];                       //Roll do acelerometro pode ser calculado.
 
       //57.296 = 1 / (3.142 / 180) The Arduino asin function is in radians
-      angle_pitch_acc = asin((float)acc_y/acc_total_vector[0])* 57.296;                //Calculate the pitch angle.
-      angle_roll_acc = asin((float)acc_x/acc_total_vector[0])* -57.296;                //Calculate the roll angle.
+      if(pitch_acc_valid)angle_pitch_acc = asin((float)acc_y/acc_total_vector[0])* 57.296;  //Calculate the pitch angle.
+      if(roll_acc_valid)angle_roll_acc = asin((float)acc_x/acc_total_vector[0])* -57.296;   //Calculate the roll angle.
       
       if(!first_angle){
-        angle_pitch = angle_pitch_acc;                                                 //Set the pitch angle to the accelerometer angle.
-        angle_roll = angle_roll_acc;                                                   //Set the roll angle to the accelerometer angle.
-        first_angle = true;
+        if(pitch_acc_valid && roll_acc_valid){                                         //So inicia a estimativa com os dois angulos do acelerometro validos.
+          angle_pitch = angle_pitch_acc;                                               //Set the pitch angle to the accelerometer angle.
+          angle_roll = angle_roll_acc;                                                 //Set the roll angle to the accelerometer angle.
+          first_angle = true;
+        }
       }
       else{
-        angle_pitch = angle_pitch * 0.9996 + angle_pitch_acc * 0.0004;                 //Correct the drift of the gyro pitch angle with the accelerometer pitch angle.
-        angle_roll = angle_roll * 0.9996 + angle_roll_acc * 0.0004;                    //Correct the drift of the gyro roll angle with the accelerometer roll angle.
+        if(pitch_acc_valid)angle_pitch = angle_pitch * 0.9996 + angle_pitch_acc * 0.0004;  //Correct the drift of the gyro pitch angle with the accelerometer pitch angle.
+        if(roll_acc_valid)angle_roll = angle_roll * 0.9996 + angle_roll_acc * 0.0004;     //Correct the drift of the gyro roll angle with the accelerometer roll angle.
       }
 
       //We can't print all the data at once. This takes to long and the angular readings will be off.

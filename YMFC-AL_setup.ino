@@ -17,6 +17,8 @@
 
 #include <Wire.h>               //Include the Wire.h library so we can communicate with the gyro
 #include <EEPROM.h>             //Include the EEPROM.h library so we can store information onto the EEPROM
+#include <util/atomic.h>        // Include the util/atomic.h library so we can use ATOMIC_BLOCK to prevent interrupts during critical code sections
+
 
 //Declaring Global Variables
 byte last_channel_1, last_channel_2, last_channel_3, last_channel_4;
@@ -25,6 +27,16 @@ byte channel_1_assign, channel_2_assign, channel_3_assign, channel_4_assign;
 byte roll_axis, pitch_axis, yaw_axis;
 byte receiver_check_byte, gyro_check_byte;
 volatile int receiver_input_channel_1, receiver_input_channel_2, receiver_input_channel_3, receiver_input_channel_4;
+
+// Instante de recebimento do ultimo pulso de cada canal
+volatile unsigned long last_pulse_time[4] = {0, 0, 0, 0};
+
+// Indica quais canais ja receberam pelo menos um pulso
+volatile byte received_channels = 0;
+
+// Tempo maximo sem receber um novo pulso (100 ms)
+const unsigned long RECEIVER_TIMEOUT_US = 100000UL;
+
 int center_channel_1, center_channel_2, center_channel_3, center_channel_4;
 int high_channel_1, high_channel_2, high_channel_3, high_channel_4;
 int low_channel_1, low_channel_2, low_channel_3, low_channel_4;
@@ -44,6 +56,10 @@ void setup(){
   PCMSK0 |= (1 << PCINT2);  // set PCINT2 (digital input 10)to trigger an interrupt on state change
   PCMSK0 |= (1 << PCINT3);  // set PCINT3 (digital input 11)to trigger an interrupt on state change
   Wire.begin();             //Start the I2C as master
+  //Limita a 25 ms (25000 us) cada espera interna da Wire; sem isso a biblioteca pode
+  //ficar presa para sempre se o barramento travar. false = nao reinicia o hardware TWI
+  //(sem recuperacao automatica).
+  Wire.setWireTimeout(25000, false);
   Serial.begin(57600);      //Start the serial connetion @ 57600bps
   delay(250);               //Give the gyro time to start 
 }
@@ -292,11 +308,15 @@ void loop(){
     for (cal_int = 0; cal_int < 2000 ; cal_int ++){              //Take 2000 readings for calibration.
       if(cal_int % 100 == 0)Serial.print(F("."));                //Print dot to indicate calibration.
       gyro_signalen();                                           //Read the gyro output.
+      if(error == 1)break;                                       //Falha I2C: para antes de somar uma leitura invalida.
       gyro_roll_cal += gyro_roll;                                //Ad roll value to gyro_roll_cal.
       gyro_pitch_cal += gyro_pitch;                              //Ad pitch value to gyro_pitch_cal.
       gyro_yaw_cal += gyro_yaw;                                  //Ad yaw value to gyro_yaw_cal.
       delay(4);                                                  //Wait 3 milliseconds before the next loop.
     }
+  }
+  //So mostra offsets e configura os eixos se a calibracao leu o giroscopio sem erro.
+  if(error == 0){
     //Now that we have 2000 measures, we need to devide by 2000 to get the average gyro offset.
     gyro_roll_cal /= 2000;                                       //Divide the roll total by 2000.
     gyro_pitch_cal /= 2000;                                      //Divide the pitch total by 2000.
@@ -410,43 +430,44 @@ void loop(){
     Serial.println(F("Writing EEPROM"));
     delay(1000);
     Serial.println(F("Done!"));
-    EEPROM.write(0, center_channel_1 & 0b11111111);
-    EEPROM.write(1, center_channel_1 >> 8);
-    EEPROM.write(2, center_channel_2 & 0b11111111);
-    EEPROM.write(3, center_channel_2 >> 8);
-    EEPROM.write(4, center_channel_3 & 0b11111111);
-    EEPROM.write(5, center_channel_3 >> 8);
-    EEPROM.write(6, center_channel_4 & 0b11111111);
-    EEPROM.write(7, center_channel_4 >> 8);
-    EEPROM.write(8, high_channel_1 & 0b11111111);
-    EEPROM.write(9, high_channel_1 >> 8);
-    EEPROM.write(10, high_channel_2 & 0b11111111);
-    EEPROM.write(11, high_channel_2 >> 8);
-    EEPROM.write(12, high_channel_3 & 0b11111111);
-    EEPROM.write(13, high_channel_3 >> 8);
-    EEPROM.write(14, high_channel_4 & 0b11111111);
-    EEPROM.write(15, high_channel_4 >> 8);
-    EEPROM.write(16, low_channel_1 & 0b11111111);
-    EEPROM.write(17, low_channel_1 >> 8);
-    EEPROM.write(18, low_channel_2 & 0b11111111);
-    EEPROM.write(19, low_channel_2 >> 8);
-    EEPROM.write(20, low_channel_3 & 0b11111111);
-    EEPROM.write(21, low_channel_3 >> 8);
-    EEPROM.write(22, low_channel_4 & 0b11111111);
-    EEPROM.write(23, low_channel_4 >> 8);
-    EEPROM.write(24, channel_1_assign);
-    EEPROM.write(25, channel_2_assign);
-    EEPROM.write(26, channel_3_assign);
-    EEPROM.write(27, channel_4_assign);
-    EEPROM.write(28, roll_axis);
-    EEPROM.write(29, pitch_axis);
-    EEPROM.write(30, yaw_axis);
-    EEPROM.write(31, type);
-    EEPROM.write(32, gyro_address);
+    //EEPROM.update() le o byte atual e so grava quando o novo valor e diferente.
+    EEPROM.update(0, center_channel_1 & 0b11111111);
+    EEPROM.update(1, center_channel_1 >> 8);
+    EEPROM.update(2, center_channel_2 & 0b11111111);
+    EEPROM.update(3, center_channel_2 >> 8);
+    EEPROM.update(4, center_channel_3 & 0b11111111);
+    EEPROM.update(5, center_channel_3 >> 8);
+    EEPROM.update(6, center_channel_4 & 0b11111111);
+    EEPROM.update(7, center_channel_4 >> 8);
+    EEPROM.update(8, high_channel_1 & 0b11111111);
+    EEPROM.update(9, high_channel_1 >> 8);
+    EEPROM.update(10, high_channel_2 & 0b11111111);
+    EEPROM.update(11, high_channel_2 >> 8);
+    EEPROM.update(12, high_channel_3 & 0b11111111);
+    EEPROM.update(13, high_channel_3 >> 8);
+    EEPROM.update(14, high_channel_4 & 0b11111111);
+    EEPROM.update(15, high_channel_4 >> 8);
+    EEPROM.update(16, low_channel_1 & 0b11111111);
+    EEPROM.update(17, low_channel_1 >> 8);
+    EEPROM.update(18, low_channel_2 & 0b11111111);
+    EEPROM.update(19, low_channel_2 >> 8);
+    EEPROM.update(20, low_channel_3 & 0b11111111);
+    EEPROM.update(21, low_channel_3 >> 8);
+    EEPROM.update(22, low_channel_4 & 0b11111111);
+    EEPROM.update(23, low_channel_4 >> 8);
+    EEPROM.update(24, channel_1_assign);
+    EEPROM.update(25, channel_2_assign);
+    EEPROM.update(26, channel_3_assign);
+    EEPROM.update(27, channel_4_assign);
+    EEPROM.update(28, roll_axis);
+    EEPROM.update(29, pitch_axis);
+    EEPROM.update(30, yaw_axis);
+    EEPROM.update(31, type);
+    EEPROM.update(32, gyro_address);
     //Write the EEPROM signature
-    EEPROM.write(33, 'J'); 
-    EEPROM.write(34, 'M');
-    EEPROM.write(35, 'B');
+    EEPROM.update(33, 'J');
+    EEPROM.update(34, 'M');
+    EEPROM.update(35, 'B');
         
     
     //To make sure evrything is ok, verify the EEPROM data.
@@ -503,13 +524,23 @@ void loop(){
 byte search_gyro(int gyro_address, int who_am_i){
   Wire.beginTransmission(gyro_address);
   Wire.write(who_am_i);
-  Wire.endTransmission();
-  Wire.requestFrom(gyro_address, 1);
-  timer = millis() + 100;
-  while(Wire.available() < 1 && timer > millis());
+  //Endereco sem resposta e normal na busca: retornar 0 (nenhum WHO_AM_I esperado vale 0)
+  //faz o loop() tentar o proximo endereco; se nenhum responder, o ERROR 3 existente
+  //interrompe o setup.
+  if(Wire.endTransmission() != 0)return 0;
+  if(Wire.requestFrom(gyro_address, 1) != 1)return 0;
+  //timer guarda o instante inicial; o tempo decorrido (millis() - timer, sem sinal) continua certo apos o rollover.
+  timer = millis();
+  while(Wire.available() < 1 && millis() - timer < 100);
   lowByte = Wire.read();
   address = gyro_address;
   return lowByte;
+}
+
+//Falha impeditiva depois que o giroscopio ja foi encontrado (sem resposta, dados incompletos ou timeout).
+void gyro_i2c_error(){
+  Serial.println(F("I2C communication with the gyro failed!!! (ERROR 9)"));
+  error = 1;
 }
 
 void start_gyro(){
@@ -518,26 +549,25 @@ void start_gyro(){
     Wire.beginTransmission(address);                             //Start communication with the gyro with the address found during search
     Wire.write(0x20);                                            //We want to write to register 1 (20 hex)
     Wire.write(0x0F);                                            //Set the register bits as 00001111 (Turn on the gyro and enable all axis)
-    Wire.endTransmission();                                      //End the transmission with the gyro
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission with the gyro
 
     Wire.beginTransmission(address);                             //Start communication with the gyro (adress 1101001)
     Wire.write(0x20);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 6 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 byte from the gyro
+    //requestFrom() e bloqueante e devolve quantos bytes chegaram; por isso nao ha espera por Wire.available().
     Serial.print(F("Register 0x20 is set to:"));
     Serial.println(Wire.read(),BIN);
 
     Wire.beginTransmission(address);                             //Start communication with the gyro  with the address found during search
     Wire.write(0x23);                                            //We want to write to register 4 (23 hex)
     Wire.write(0x90);                                            //Set the register bits as 10010000 (Block Data Update active & 500dps full scale)
-    Wire.endTransmission();                                      //End the transmission with the gyro
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission with the gyro
     
     Wire.beginTransmission(address);                             //Start communication with the gyro (adress 1101001)
     Wire.write(0x23);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 6 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 byte from the gyro
     Serial.print(F("Register 0x23 is set to:"));
     Serial.println(Wire.read(),BIN);
 
@@ -548,26 +578,24 @@ void start_gyro(){
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x6B);                                            //PWR_MGMT_1 register
     Wire.write(0x00);                                            //Set to zero to turn on the gyro
-    Wire.endTransmission();                                      //End the transmission
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
     
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x6B);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 1 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 bytes from the gyro
     Serial.print(F("Register 0x6B is set to:"));
     Serial.println(Wire.read(),BIN);
     
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x1B);                                            //GYRO_CONFIG register
     Wire.write(0x08);                                            //Set the register bits as 00001000 (500dps full scale)
-    Wire.endTransmission();                                      //End the transmission
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
     
     Wire.beginTransmission(address);                             //Start communication with the gyro (adress 1101001)
     Wire.write(0x1B);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 1 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 bytes from the gyro
     Serial.print(F("Register 0x1B is set to:"));
     Serial.println(Wire.read(),BIN);
 
@@ -578,9 +606,8 @@ void gyro_signalen(){
   if(type == 2 || type == 3){
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(168);                                             //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 6);                                //Request 6 bytes from the gyro
-    while(Wire.available() < 6);                                 //Wait until the 6 bytes are received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 6) != 6){gyro_i2c_error(); return;} //Request 6 bytes from the gyro
     lowByte = Wire.read();                                       //First received byte is the low part of the angular data
     highByte = Wire.read();                                      //Second received byte is the high part of the angular data
     gyro_roll = ((highByte<<8)|lowByte);                         //Multiply highByte by 256 (shift left by 8) and ad lowByte
@@ -597,9 +624,8 @@ void gyro_signalen(){
   if(type == 1){
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x43);                                            //Start reading @ register 43h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address,6);                                 //Request 6 bytes from the gyro
-    while(Wire.available() < 6);                                 //Wait until the 6 bytes are received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 6) != 6){gyro_i2c_error(); return;} //Request 6 bytes from the gyro
     gyro_roll=Wire.read()<<8|Wire.read();                        //Read high and low part of the angular data
     if(cal_int == 2000)gyro_roll -= gyro_roll_cal;               //Only compensate after the calibration
     gyro_pitch=Wire.read()<<8|Wire.read();                       //Read high and low part of the angular data
@@ -613,8 +639,9 @@ void gyro_signalen(){
 void check_receiver_inputs(byte movement){
   byte trigger = 0;
   int pulse_length;
-  timer = millis() + 30000;
-  while(timer > millis() && trigger == 0){
+  //timer guarda o instante inicial; o tempo decorrido (millis() - timer, sem sinal) continua certo apos o rollover.
+  timer = millis();
+  while(millis() - timer < 30000 && trigger == 0){
     delay(250);
     if(receiver_input_channel_1 > 1750 || receiver_input_channel_1 < 1250){
       trigger = 1;
@@ -691,24 +718,122 @@ void wait_sticks_zero(){
 }
 
 //Checck if the receiver values are valid within 10 seconds
+
+
 void wait_for_receiver(){
-  byte zero = 0;
-  timer = millis() + 10000;
-  while(timer > millis() && zero < 15){
-    if(receiver_input_channel_1 < 2100 && receiver_input_channel_1 > 900)zero |= 0b00000001;
-    if(receiver_input_channel_2 < 2100 && receiver_input_channel_2 > 900)zero |= 0b00000010;
-    if(receiver_input_channel_3 < 2100 && receiver_input_channel_3 > 900)zero |= 0b00000100;
-    if(receiver_input_channel_4 < 2100 && receiver_input_channel_4 > 900)zero |= 0b00001000;
-    delay(500);
-    Serial.print(F("."));
-  }
-  if(zero == 0){
+
+    const unsigned long timeout = 10000;
+    const byte required_checks = 5;
+
+    unsigned long initial_time = millis();
+
+    byte valid_channels = 0;
+    byte consecutive_checks = 0;
+    byte received_mask = 0;
+
+    int channels[4];
+
+    unsigned long pulse_times[4];
+    unsigned long now;
+
+    while(millis() - initial_time < timeout){
+
+        // Leitura atomica das informacoes da ISR
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE){
+
+            channels[0] = receiver_input_channel_1;
+            channels[1] = receiver_input_channel_2;
+            channels[2] = receiver_input_channel_3;
+            channels[3] = receiver_input_channel_4;
+
+            for(byte i = 0; i < 4; i++){
+
+                pulse_times[i] = last_pulse_time[i];
+            }
+
+            received_mask = received_channels;
+            now = micros();
+        }
+
+        // Reinicia a mascara de validacao
+        valid_channels = 0;
+
+        for(byte i = 0; i < 4; i++){
+
+            // Verifica se a duracao do pulso e valida
+            bool valid_width =
+                channels[i] > 900 &&
+                channels[i] < 2100;
+
+            // Verifica se o canal ja recebeu um pulso
+            bool pulse_received =
+                (received_mask & (1 << i)) != 0;
+
+            // Verifica se o pulso recebido e recente
+            bool recent_pulse =
+                (now - pulse_times[i]) < RECEIVER_TIMEOUT_US;
+
+            // O canal deve satisfazer as tres condicoes
+            if(valid_width && pulse_received && recent_pulse){
+
+                valid_channels |= (1 << i);
+            }
+        }
+
+        // Verifica se todos os canais estao validos
+        if(valid_channels == B00001111){
+
+            consecutive_checks++;
+        }
+        else{
+
+            consecutive_checks = 0;
+        }
+
+        // Confirma apos cinco verificacoes consecutivas
+        if(consecutive_checks >= required_checks){
+
+            Serial.println(F(" Receiver channels OK!"));
+
+            return;
+        }
+
+        Serial.print(F("."));
+        delay(100);
+    }
+
+    // Tempo limite atingido
     error = 1;
-    Serial.println(F("."));
-    Serial.println(F("No valid receiver signals found!!! (ERROR 1)"));
-  }
-  else Serial.println(F(" OK"));
+
+    Serial.println();
+    Serial.println(F("Receiver validation failed!"));
+
+    for(byte i = 0; i < 4; i++){
+
+        if(!(valid_channels & (1 << i))){
+
+            Serial.print(F("Invalid channel: "));
+            Serial.println(i + 1);
+
+            if(!(received_mask & (1 << i))){
+
+                Serial.println(F("No pulse received."));
+            }
+            else if((now - pulse_times[i]) >= RECEIVER_TIMEOUT_US){
+
+                Serial.println(F("Receiver signal timeout."));
+            }
+            else{
+
+                Serial.println(F("Invalid pulse width."));
+            }
+        }
+    }
+
+    Serial.println(F("ERROR 1"));
 }
+
+
 
 //Register the min and max receiver values and exit when the sticks are back in the neutral position
 void register_min_max(){
@@ -745,9 +870,12 @@ void check_gyro_axes(byte movement){
   gyro_angle_pitch = 0;
   gyro_angle_yaw = 0;
   gyro_signalen();
-  timer = millis() + 10000;    
-  while(timer > millis() && gyro_angle_roll > -30 && gyro_angle_roll < 30 && gyro_angle_pitch > -30 && gyro_angle_pitch < 30 && gyro_angle_yaw > -30 && gyro_angle_yaw < 30){
+  if(error == 1)return;        //Falha I2C: sai sem usar a leitura (ERROR 9 ja foi informado).
+  //timer guarda o instante inicial; o tempo decorrido (millis() - timer, sem sinal) continua certo apos o rollover.
+  timer = millis();
+  while(millis() - timer < 10000 && gyro_angle_roll > -30 && gyro_angle_roll < 30 && gyro_angle_pitch > -30 && gyro_angle_pitch < 30 && gyro_angle_yaw > -30 && gyro_angle_yaw < 30){
     gyro_signalen();
+    if(error == 1)return;      //Falha I2C: sai sem integrar a leitura invalida.
     if(type == 2 || type == 3){
       gyro_angle_roll += gyro_roll * 0.00007;              //0.00007 = 17.5 (md/s) / 250(Hz)
       gyro_angle_pitch += gyro_pitch * 0.00007;
@@ -790,54 +918,97 @@ void check_gyro_axes(byte movement){
 }
 
 //This routine is called every time input 8, 9, 10 or 11 changed state
-ISR(PCINT0_vect){
-  current_time = micros();
-  //Channel 1=========================================
-  if(PINB & B00000001){                                        //Is input 8 high?
-    if(last_channel_1 == 0){                                   //Input 8 changed from 0 to 1
-      last_channel_1 = 1;                                      //Remember current input state
-      timer_1 = current_time;                                  //Set timer_1 to current_time
-    }
-  }
-  else if(last_channel_1 == 1){                                //Input 8 is not high and changed from 1 to 0
-    last_channel_1 = 0;                                        //Remember current input state
-    receiver_input_channel_1 = current_time - timer_1;         //Channel 1 is current_time - timer_1
-  }
-  //Channel 2=========================================
-  if(PINB & B00000010 ){                                       //Is input 9 high?
-    if(last_channel_2 == 0){                                   //Input 9 changed from 0 to 1
-      last_channel_2 = 1;                                      //Remember current input state
-      timer_2 = current_time;                                  //Set timer_2 to current_time
-    }
-  }
-  else if(last_channel_2 == 1){                                //Input 9 is not high and changed from 1 to 0
-    last_channel_2 = 0;                                        //Remember current input state
-    receiver_input_channel_2 = current_time - timer_2;         //Channel 2 is current_time - timer_2
-  }
-  //Channel 3=========================================
-  if(PINB & B00000100 ){                                       //Is input 10 high?
-    if(last_channel_3 == 0){                                   //Input 10 changed from 0 to 1
-      last_channel_3 = 1;                                      //Remember current input state
-      timer_3 = current_time;                                  //Set timer_3 to current_time
-    }
-  }
-  else if(last_channel_3 == 1){                                //Input 10 is not high and changed from 1 to 0
-    last_channel_3 = 0;                                        //Remember current input state
-    receiver_input_channel_3 = current_time - timer_3;         //Channel 3 is current_time - timer_3
 
-  }
-  //Channel 4=========================================
-  if(PINB & B00001000 ){                                       //Is input 11 high?
-    if(last_channel_4 == 0){                                   //Input 11 changed from 0 to 1
-      last_channel_4 = 1;                                      //Remember current input state
-      timer_4 = current_time;                                  //Set timer_4 to current_time
+ISR(PCINT0_vect){
+
+    current_time = micros();
+
+    // CANAL 1 - Pino digital 8
+    if(PINB & B00000001){
+
+        if(last_channel_1 == 0){
+
+            last_channel_1 = 1;
+            timer_1 = current_time;
+        }
     }
-  }
-  else if(last_channel_4 == 1){                                //Input 11 is not high and changed from 1 to 0
-    last_channel_4 = 0;                                        //Remember current input state
-    receiver_input_channel_4 = current_time - timer_4;         //Channel 4 is current_time - timer_4
-  }
+    else if(last_channel_1 == 1){
+
+        last_channel_1 = 0;
+
+        unsigned long pulse = current_time - timer_1;
+
+        // Evita overflow na conversao para int
+        receiver_input_channel_1 = (pulse <= 32767UL) ? pulse : 0;
+
+        last_pulse_time[0] = current_time;
+        received_channels |= B00000001;
+    }
+
+    // CANAL 2 - Pino digital 9
+    if(PINB & B00000010){
+
+        if(last_channel_2 == 0){
+
+            last_channel_2 = 1;
+            timer_2 = current_time;
+        }
+    }
+    else if(last_channel_2 == 1){
+
+        last_channel_2 = 0;
+
+        unsigned long pulse = current_time - timer_2;
+
+        receiver_input_channel_2 = (pulse <= 32767UL) ? pulse : 0;
+
+        last_pulse_time[1] = current_time;
+        received_channels |= B00000010;
+    }
+
+    // CANAL 3 - Pino digital 10
+    if(PINB & B00000100){
+
+        if(last_channel_3 == 0){
+
+            last_channel_3 = 1;
+            timer_3 = current_time;
+        }
+    }
+    else if(last_channel_3 == 1){
+
+        last_channel_3 = 0;
+
+        unsigned long pulse = current_time - timer_3;
+
+        receiver_input_channel_3 = (pulse <= 32767UL) ? pulse : 0;
+
+        last_pulse_time[2] = current_time;
+        received_channels |= B00000100;
+    }
+
+    // CANAL 4 - Pino digital 11
+    if(PINB & B00001000){
+
+        if(last_channel_4 == 0){
+
+            last_channel_4 = 1;
+            timer_4 = current_time;
+        }
+    }
+    else if(last_channel_4 == 1){
+
+        last_channel_4 = 0;
+
+        unsigned long pulse = current_time - timer_4;
+
+        receiver_input_channel_4 = (pulse <= 32767UL) ? pulse : 0;
+
+        last_pulse_time[3] = current_time;
+        received_channels |= B00001000;
+    }
 }
+
 
 //Intro subroutine
 void intro(){
