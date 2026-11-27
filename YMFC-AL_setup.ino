@@ -56,6 +56,10 @@ void setup(){
   PCMSK0 |= (1 << PCINT2);  // set PCINT2 (digital input 10)to trigger an interrupt on state change
   PCMSK0 |= (1 << PCINT3);  // set PCINT3 (digital input 11)to trigger an interrupt on state change
   Wire.begin();             //Start the I2C as master
+  //Limita a 25 ms (25000 us) cada espera interna da Wire; sem isso a biblioteca pode
+  //ficar presa para sempre se o barramento travar. false = nao reinicia o hardware TWI
+  //(sem recuperacao automatica).
+  Wire.setWireTimeout(25000, false);
   Serial.begin(57600);      //Start the serial connetion @ 57600bps
   delay(250);               //Give the gyro time to start 
 }
@@ -304,11 +308,15 @@ void loop(){
     for (cal_int = 0; cal_int < 2000 ; cal_int ++){              //Take 2000 readings for calibration.
       if(cal_int % 100 == 0)Serial.print(F("."));                //Print dot to indicate calibration.
       gyro_signalen();                                           //Read the gyro output.
+      if(error == 1)break;                                       //Falha I2C: para antes de somar uma leitura invalida.
       gyro_roll_cal += gyro_roll;                                //Ad roll value to gyro_roll_cal.
       gyro_pitch_cal += gyro_pitch;                              //Ad pitch value to gyro_pitch_cal.
       gyro_yaw_cal += gyro_yaw;                                  //Ad yaw value to gyro_yaw_cal.
       delay(4);                                                  //Wait 3 milliseconds before the next loop.
     }
+  }
+  //So mostra offsets e configura os eixos se a calibracao leu o giroscopio sem erro.
+  if(error == 0){
     //Now that we have 2000 measures, we need to devide by 2000 to get the average gyro offset.
     gyro_roll_cal /= 2000;                                       //Divide the roll total by 2000.
     gyro_pitch_cal /= 2000;                                      //Divide the pitch total by 2000.
@@ -516,13 +524,22 @@ void loop(){
 byte search_gyro(int gyro_address, int who_am_i){
   Wire.beginTransmission(gyro_address);
   Wire.write(who_am_i);
-  Wire.endTransmission();
-  Wire.requestFrom(gyro_address, 1);
+  //Endereco sem resposta e normal na busca: retornar 0 (nenhum WHO_AM_I esperado vale 0)
+  //faz o loop() tentar o proximo endereco; se nenhum responder, o ERROR 3 existente
+  //interrompe o setup.
+  if(Wire.endTransmission() != 0)return 0;
+  if(Wire.requestFrom(gyro_address, 1) != 1)return 0;
   timer = millis() + 100;
   while(Wire.available() < 1 && timer > millis());
   lowByte = Wire.read();
   address = gyro_address;
   return lowByte;
+}
+
+//Falha impeditiva depois que o giroscopio ja foi encontrado (sem resposta, dados incompletos ou timeout).
+void gyro_i2c_error(){
+  Serial.println(F("I2C communication with the gyro failed!!! (ERROR 9)"));
+  error = 1;
 }
 
 void start_gyro(){
@@ -531,26 +548,25 @@ void start_gyro(){
     Wire.beginTransmission(address);                             //Start communication with the gyro with the address found during search
     Wire.write(0x20);                                            //We want to write to register 1 (20 hex)
     Wire.write(0x0F);                                            //Set the register bits as 00001111 (Turn on the gyro and enable all axis)
-    Wire.endTransmission();                                      //End the transmission with the gyro
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission with the gyro
 
     Wire.beginTransmission(address);                             //Start communication with the gyro (adress 1101001)
     Wire.write(0x20);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 6 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 byte from the gyro
+    //requestFrom() e bloqueante e devolve quantos bytes chegaram; por isso nao ha espera por Wire.available().
     Serial.print(F("Register 0x20 is set to:"));
     Serial.println(Wire.read(),BIN);
 
     Wire.beginTransmission(address);                             //Start communication with the gyro  with the address found during search
     Wire.write(0x23);                                            //We want to write to register 4 (23 hex)
     Wire.write(0x90);                                            //Set the register bits as 10010000 (Block Data Update active & 500dps full scale)
-    Wire.endTransmission();                                      //End the transmission with the gyro
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission with the gyro
     
     Wire.beginTransmission(address);                             //Start communication with the gyro (adress 1101001)
     Wire.write(0x23);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 6 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 byte from the gyro
     Serial.print(F("Register 0x23 is set to:"));
     Serial.println(Wire.read(),BIN);
 
@@ -561,26 +577,24 @@ void start_gyro(){
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x6B);                                            //PWR_MGMT_1 register
     Wire.write(0x00);                                            //Set to zero to turn on the gyro
-    Wire.endTransmission();                                      //End the transmission
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
     
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x6B);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 1 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 bytes from the gyro
     Serial.print(F("Register 0x6B is set to:"));
     Serial.println(Wire.read(),BIN);
     
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x1B);                                            //GYRO_CONFIG register
     Wire.write(0x08);                                            //Set the register bits as 00001000 (500dps full scale)
-    Wire.endTransmission();                                      //End the transmission
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
     
     Wire.beginTransmission(address);                             //Start communication with the gyro (adress 1101001)
     Wire.write(0x1B);                                            //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 1);                                //Request 1 bytes from the gyro
-    while(Wire.available() < 1);                                 //Wait until the 1 byte is received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 1) != 1){gyro_i2c_error(); return;} //Request 1 bytes from the gyro
     Serial.print(F("Register 0x1B is set to:"));
     Serial.println(Wire.read(),BIN);
 
@@ -591,9 +605,8 @@ void gyro_signalen(){
   if(type == 2 || type == 3){
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(168);                                             //Start reading @ register 28h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address, 6);                                //Request 6 bytes from the gyro
-    while(Wire.available() < 6);                                 //Wait until the 6 bytes are received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 6) != 6){gyro_i2c_error(); return;} //Request 6 bytes from the gyro
     lowByte = Wire.read();                                       //First received byte is the low part of the angular data
     highByte = Wire.read();                                      //Second received byte is the high part of the angular data
     gyro_roll = ((highByte<<8)|lowByte);                         //Multiply highByte by 256 (shift left by 8) and ad lowByte
@@ -610,9 +623,8 @@ void gyro_signalen(){
   if(type == 1){
     Wire.beginTransmission(address);                             //Start communication with the gyro
     Wire.write(0x43);                                            //Start reading @ register 43h and auto increment with every read
-    Wire.endTransmission();                                      //End the transmission
-    Wire.requestFrom(address,6);                                 //Request 6 bytes from the gyro
-    while(Wire.available() < 6);                                 //Wait until the 6 bytes are received
+    if(Wire.endTransmission() != 0){gyro_i2c_error(); return;}   //End the transmission
+    if(Wire.requestFrom(address, 6) != 6){gyro_i2c_error(); return;} //Request 6 bytes from the gyro
     gyro_roll=Wire.read()<<8|Wire.read();                        //Read high and low part of the angular data
     if(cal_int == 2000)gyro_roll -= gyro_roll_cal;               //Only compensate after the calibration
     gyro_pitch=Wire.read()<<8|Wire.read();                       //Read high and low part of the angular data
@@ -856,9 +868,11 @@ void check_gyro_axes(byte movement){
   gyro_angle_pitch = 0;
   gyro_angle_yaw = 0;
   gyro_signalen();
+  if(error == 1)return;        //Falha I2C: sai sem usar a leitura (ERROR 9 ja foi informado).
   timer = millis() + 10000;    
   while(timer > millis() && gyro_angle_roll > -30 && gyro_angle_roll < 30 && gyro_angle_pitch > -30 && gyro_angle_pitch < 30 && gyro_angle_yaw > -30 && gyro_angle_yaw < 30){
     gyro_signalen();
+    if(error == 1)return;      //Falha I2C: sai sem integrar a leitura invalida.
     if(type == 2 || type == 3){
       gyro_angle_roll += gyro_roll * 0.00007;              //0.00007 = 17.5 (md/s) / 250(Hz)
       gyro_angle_pitch += gyro_pitch * 0.00007;
