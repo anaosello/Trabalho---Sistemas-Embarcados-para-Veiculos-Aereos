@@ -1,0 +1,27 @@
+# Configurações locais de desenvolvimento
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.claude.json
+.mcp.json
+
+# Configurações locais do editor (VS Code e extensão Arduino)
+.vscode/
+
+# Artefatos de compilação do Arduino
+# arduino-cli --export-binaries e Arduino IDE 2 criam build/ na pasta do sketch;
+# "Exportar binário compilado" do Arduino IDE 1.x grava .hex ao lado do .ino
+build/
+*.hex
+*.elf
+*.eep
+
+# Arquivos temporários e de backup de merge
+*.tmp
+*~
+*.orig
+
+# Arquivos gerados pelo sistema operacional
+Thumbs.db
+desktop.ini
+.DS_Store
