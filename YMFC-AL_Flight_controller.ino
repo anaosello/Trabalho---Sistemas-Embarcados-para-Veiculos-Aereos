@@ -246,10 +246,8 @@ void loop(){
 
   //The PID set point in degrees per second is determined by the roll receiver input.
   //In the case of deviding by 3 the max roll rate is aprox 164 degrees per second ( (500-8)/3 = 164d/s ).
-  pid_roll_setpoint = 0;
   //We need a little dead band of 16us for better results.
-  if(receiver_input_channel_1 > 1508)pid_roll_setpoint = receiver_input_channel_1 - 1508;
-  else if(receiver_input_channel_1 < 1492)pid_roll_setpoint = receiver_input_channel_1 - 1492;
+  pid_roll_setpoint = apply_dead_band(receiver_input_channel_1);            //Retorna 0 dentro da zona morta
 
   pid_roll_setpoint -= roll_level_adjust;                                   //Subtract the angle correction from the standardized receiver roll input value.
   pid_roll_setpoint /= 3.0;                                                 //Divide the setpoint for the PID roll controller by 3 to get angles in degrees.
@@ -257,10 +255,8 @@ void loop(){
 
   //The PID set point in degrees per second is determined by the pitch receiver input.
   //In the case of deviding by 3 the max pitch rate is aprox 164 degrees per second ( (500-8)/3 = 164d/s ).
-  pid_pitch_setpoint = 0;
   //We need a little dead band of 16us for better results.
-  if(receiver_input_channel_2 > 1508)pid_pitch_setpoint = receiver_input_channel_2 - 1508;
-  else if(receiver_input_channel_2 < 1492)pid_pitch_setpoint = receiver_input_channel_2 - 1492;
+  pid_pitch_setpoint = apply_dead_band(receiver_input_channel_2);           //Retorna 0 dentro da zona morta
 
   pid_pitch_setpoint -= pitch_level_adjust;                                  //Subtract the angle correction from the standardized receiver pitch input value.
   pid_pitch_setpoint /= 3.0;                                                 //Divide the setpoint for the PID pitch controller by 3 to get angles in degrees.
@@ -270,8 +266,7 @@ void loop(){
   pid_yaw_setpoint = 0;
   //We need a little dead band of 16us for better results.
   if(receiver_input_channel_3 > 1050){ //Do not yaw when turning off the motors.
-    if(receiver_input_channel_4 > 1508)pid_yaw_setpoint = (receiver_input_channel_4 - 1508)/3.0;
-    else if(receiver_input_channel_4 < 1492)pid_yaw_setpoint = (receiver_input_channel_4 - 1492)/3.0;
+    pid_yaw_setpoint = apply_dead_band(receiver_input_channel_4)/3.0;       //Retorna 0 dentro da zona morta
   }
   
   calculate_pid();                                                            //PID inputs are known. So we can calculate the pid output.
@@ -523,6 +518,19 @@ void reset_pid(){
   pid_last_pitch_d_error = 0;
   pid_i_mem_yaw = 0;
   pid_last_yaw_d_error = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Subrotina para aplicar a zona morta aos comandos do receptor
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Reune o calculo que se repetia para roll, pitch e yaw no loop().
+//Recebe o pulso padronizado (1000 - 2000us) e retorna a distancia ate a zona morta (1492 - 1508us).
+//Dentro da zona morta, inclusive nos limites, retorna 0.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+int apply_dead_band(int pulse){
+  if(pulse > 1508)return pulse - 1508;                                      //Acima da zona morta: desconta o limite superior
+  else if(pulse < 1492)return pulse - 1492;                                 //Abaixo da zona morta: desconta o limite inferior
+  return 0;                                                                 //Dentro da zona morta: comando nulo
 }
 
 //This part converts the actual receiver signals to a standardized 1000 – 1500 – 2000 microsecond value.
