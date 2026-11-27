@@ -22,6 +22,25 @@ O alerta de bateria e a falha de temporização passaram a ter estados separados
 
 Branch `feat/receiver-failsafe`
 
-`tests/receiver_diagnostics/receiver_diagnostics.ino` é um sketch novo, independente do controlador de voo, e não recupera código anterior. Com os critérios da E.1, ele classifica cada canal como válido, ausente, desatualizado ou com pulso inválido e indica quando o canal é restabelecido. Os 12 cenários, com amostras simuladas em uma `struct`, incluem limites de largura e de tempo e a volta a zero de `micros()`.
+Foi desenvolvido um sketch independente (`tests/receiver_diagnostics/receiver_diagnostics.ino`) que utiliza os critérios da E.1 para classificar os canais do receptor como válidos, ausentes, desatualizados ou com pulsos inválidos, além de identificar o restabelecimento do sinal.
 
-O sketch trabalha só com dados simulados e mostra o resultado no monitor serial, sem acionar motores.
+### Testes e resultados
+
+Os testes foram realizados no Wokwi, utilizando um Arduino Uno virtual e 12 cenários com dados simulados. Os resultados apresentados no monitor serial foram comparados com os valores esperados.
+
+| Cenário | Máscara esperada | Máscara obtida |
+|---|---|---|
+| Quatro canais válidos | `1111` | `1111` |
+| Um canal ausente | `1101` | `1101` |
+| Dois canais ausentes | `0011` | `0011` |
+| Pulso abaixo do limite | `1110` | `1110` |
+| Restabelecimento de um canal | `1111` | `1111` |
+| Pulso acima do limite | `0111` | `0111` |
+| Dados desatualizados | `0000` | `0000` |
+| Limites de largura dos pulsos | `0110` | `0110` |
+| Limite do timeout | `1001` | `1001` |
+| Overflow do contador temporal | `1101` | `1101` |
+| Falhas simultâneas | `0000` | `0000` |
+| Restabelecimento dos quatro canais | `1111` | `1111` |
+
+Todos os 12 cenários apresentaram os resultados esperados, sem divergências nas 48 classificações individuais. A simulação confirmou o funcionamento da lógica de diagnóstico, incluindo a identificação de falhas, a prioridade entre elas e o restabelecimento dos canais.
