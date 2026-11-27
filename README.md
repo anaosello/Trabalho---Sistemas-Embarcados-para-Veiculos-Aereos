@@ -791,3 +791,66 @@ A verificação foi feita por inspeção do código e compilação.
 Refatoração sem mudança de comportamento esperada; não foi testada em hardware.
 O comportamento original no desarme, sem reset do PID, foi mantido de propósito.
 Não houve medição experimental do tempo de execução nem comparação dos binários gerados.
+
+---
+
+## Melhoria H.1 — Redução de escritas desnecessárias na EEPROM
+
+**Responsável:** H (identificação completa a confirmar)
+
+**Branch:** `fix/eeprom-wear`
+
+**Arquivos modificados:** `YMFC-AL_setup.ino` e `README.md`.
+
+### 1. Problema identificado
+
+Ao terminar sem erros, o `YMFC-AL_setup.ino` grava os 36 bytes de configuração (endereços 0 a 35) com `EEPROM.write()`, que grava o byte sempre, mesmo quando o valor guardado já é igual ao novo. Assim, repetir o setup com a mesma configuração regrava todos os 36 bytes.
+
+### 2. Conteúdo das aulas relacionado
+
+- Sistemas Embarcados (EESC, Ago/2026), p. 8/16: na visão geral de um sistema embarcado, o bloco "Memórias: ROM, RAM" aparece ligado ao microcontrolador; na p. 17, o MCU reúne em um único chip a CPU, a memória ("RAM & Flash") e o I/O básico; na p. 21, o Arduino UNO aparece com RAM de 2 KB e ROM de 32 KB.
+- Sistemas Embarcados (EESC, Ago/2026), p. 30: no mapa de falhas de energia, a corrupção de dados aparece como "Erros em EEPROM, Flash ou RAM".
+- Aula 0x0001, pp. 10–13: no processo típico de build, arquivos de biblioteca (`.a`, com `.h`) são unidos ao código compilado pelo linker para gerar o executável; a `EEPROM.h` já era incluída pelo sketch original (linha 19), ou seja, nenhuma biblioteca foi acrescentada.
+
+Conhecimento externo às aulas: na biblioteca EEPROM do core `arduino:avr` 1.8.8 (`EEPROM.h`), `EEPROM.write(endereço, valor)` chama `eeprom_write_byte` da avr-libc em toda chamada; `EEPROM.update(endereço, valor)`, com a mesma assinatura, primeiro lê o byte com `eeprom_read_byte` e só chama `eeprom_write_byte` quando o valor novo é diferente. Segundo o "Atmel ATmega328/P Datasheet Complete" (documento Atmel-42735B-ATmega328/P_Datasheet_Complete-11/2016), seção 12.4 "EEPROM Data Memory", a EEPROM tem durabilidade de pelo menos 100.000 ciclos de escrita/apagamento.
+
+### 3. Alteração realizada
+
+As 36 chamadas `EEPROM.write()` do bloco de gravação foram trocadas por `EEPROM.update()`, com os mesmos argumentos e na mesma ordem:
+
+| Endereços | Conteúdo |
+|---|---|
+| 0–23 | `center_channel_1..4`, `high_channel_1..4` e `low_channel_1..4` (byte baixo e byte alto) |
+| 24–32 | `channel_1_assign` a `channel_4_assign` (24–27), `roll_axis`, `pitch_axis`, `yaw_axis` (28–30), `type` (31) e `gyro_address` (32) |
+| 33–35 | assinatura `'J'`, `'M'`, `'B'` |
+
+Foi acrescentado um comentário antes das chamadas explicando o comportamento de `EEPROM.update()`. A verificação que relê os 36 bytes, as mensagens seriais, o formato dos dados e as leituras feitas pelo `YMFC-AL_Flight_controller.ino` e pelo `YMFC-AL_esc_calibrate.ino` não foram alterados.
+
+### 4. Justificativa
+
+`EEPROM.write()` grava sempre; `EEPROM.update()` lê o byte atual, compara com o novo e só grava se for diferente, com o mesmo conteúdo final; cada gravação desnecessária gasta um ciclo de um recurso limitado, e evitá-la reduz o desgaste da EEPROM, sem ganho quantitativo estimado.
+Comportamento esperado (não observado): os endereços 0–23 guardam medições do receptor (centro, máximo e mínimo, em µs), que podem variar alguns microssegundos entre execuções do setup; por isso esses bytes, principalmente os bytes baixos, tendem a ser regravados, e a economia é mais provável nos bytes que se repetem (24–35: atribuição de canais, eixos, tipo, endereço do giroscópio e assinatura `'J'`, `'M'`, `'B'`).
+
+### 5. Resultados de compilação
+
+Em 26/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os sketches foram compilados a partir de cópias em pastas separadas.
+
+| `YMFC-AL_setup.ino` | Referência da develop (`45b3d5e`) | Versão modificada |
+|---|---:|---:|
+| Flash utilizada | 20572 bytes | 20608 bytes |
+| SRAM global utilizada | 532 bytes | 532 bytes |
+
+O setup passou a ocupar 36 bytes a mais de Flash, diferença decorrente da troca por `EEPROM.update()`. `YMFC-AL_Flight_controller.ino` e `YMFC-AL_esc_calibrate.ino` não mudaram e compilaram com os mesmos valores da referência (12548/501 e 13126/1106 bytes de Flash/SRAM global).
+
+### 6. Verificações realizadas
+
+Verificações conceituais, descrevendo o comportamento esperado pela implementação da biblioteca (não observado em hardware), feitas por inspeção do código e compilação:
+
+- Endereço com valor diferente: `update` lê, compara e chama a mesma `eeprom_write_byte` usada por `write`; o byte final é igual ao gravado por `write`.
+- Endereço com o mesmo valor: não há gravação; o conteúdo final já é o valor pedido e a verificação que relê os 36 bytes continua passando.
+- Configuração idêntica repetida: se os 36 bytes forem iguais, nenhuma escrita é feita; se só parte mudou, apenas os bytes diferentes são gravados. Na prática, como explicado na seção 4, os endereços 0–23 tendem a mudar entre execuções, e os 24–35 tendem a se repetir.
+- Formato preservado: mesmos endereços 0–35, mesmos bytes, mesma ordem e mesma assinatura; as leituras do controlador de voo e do `esc_calibrate` continuam compatíveis.
+
+### 7. Limitações
+
+Não houve gravação nem leitura em hardware, nem contagem de ciclos de escrita. `EEPROM.update()` acrescenta uma leitura por byte durante a gravação da configuração, apenas no setup. A alteração não valida a coerência dos parâmetros gravados nem protege contra corrupção da EEPROM por queda de alimentação.
