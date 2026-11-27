@@ -111,6 +111,11 @@ void setup(){
   //Check the EEPROM signature to make sure that the setup program is executed.
   while(eeprom_data[33] != 'J' || eeprom_data[34] != 'M' || eeprom_data[35] != 'B')delay(10);
 
+  //A assinatura so mostra que o setup ja a gravou alguma vez; nao garante que a ultima gravacao terminou nem que os dados sejam coerentes.
+  //Configuracao do receptor invalida: fica neste laco, como no da assinatura (LED do pino 12 aceso,
+  //pinos 4 a 7 dos ESCs em LOW e sem pulsos), antes do primeiro uso dos parametros e do armamento.
+  while(!receiver_settings_valid())delay(10);
+
   //The flight controller needs the MPU-6050 with gyro and accelerometer
   //If setup is completed without MPU-6050 stop the flight controller program  
   if(eeprom_data[31] == 2 || eeprom_data[31] == 3)delay(10);
@@ -565,6 +570,36 @@ int convert_receiver_channel(byte function){
     else return 1500 + difference;                                             //If the channel is not reversed
   }
   else return 1500;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Subrotina para validar as configuracoes do receptor gravadas na EEPROM
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Confere na copia eeprom_data[] os enderecos 0 a 27, que convert_receiver_channel() usa como indice e como divisor.
+//Enderecos 24 a 27: sem o bit 7 (inversao), a entrada deve ser 1, 2, 3 ou 4, os valores gravados pelo setup.
+//As quatro funcoes devem usar entradas diferentes: a mascara precisa ficar com os bits 1 a 4 ligados (0b00011110).
+//Enderecos 0 a 23: em cada entrada, 0 < low < center < high; assim (center - low) e (high - center) ficam entre 1 e 32766, sem zero nem estouro do int.
+//So le os dados: nao grava a EEPROM, nao muda o formato e nao corrige valores. Executada apenas no setup().
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+bool receiver_settings_valid(){
+  byte function, channel;
+  byte used_channels = 0;                                                      //Bit n ligado = entrada n ja usada por uma funcao
+  int low, center, high;
+
+  for(function = 1; function <= 4; function++){                                //Roll, pitch, throttle e yaw (enderecos 24 a 27)
+    channel = eeprom_data[function + 23] & 0b01111111;                         //Ignora so o bit 7 (inversao), que convert_receiver_channel() continua usando
+    if(channel < 1 || channel > 4)return false;                                //Entrada fora da faixa gravada pelo setup
+    used_channels |= 1 << channel;                                             //Marca a entrada usada por esta funcao
+  }
+  if(used_channels != 0b00011110)return false;                                 //Entrada repetida: uma das quatro ficou sem uso
+
+  for(channel = 1; channel <= 4; channel++){                                   //Calibracao das quatro entradas (enderecos 0 a 23)
+    low = (eeprom_data[channel * 2 + 15] << 8) | eeprom_data[channel * 2 + 14];  //Mesmos indices de convert_receiver_channel()
+    center = (eeprom_data[channel * 2 - 1] << 8) | eeprom_data[channel * 2 - 2];
+    high = (eeprom_data[channel * 2 + 7] << 8) | eeprom_data[channel * 2 + 6];
+    if(low <= 0 || low >= center || center >= high)return false;               //0 = pulso invalido na ISR do setup; negativo = dado corrompido; ordem incoerente ou divisor nulo
+  }
+  return true;                                                                 //Configuracao do receptor coerente
 }
 
 void set_gyro_registers(){
