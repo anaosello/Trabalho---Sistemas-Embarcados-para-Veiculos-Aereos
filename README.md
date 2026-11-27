@@ -1088,3 +1088,188 @@ A verificação foi feita por inspeção do código, contas à mão e compilaç�
 - O original lia cada canal `volatile` duas ou três vezes (comparações e subtração); o novo lê uma vez e passa a cópia por valor. A diferença não altera o resultado, porque esses canais só são escritos no contexto principal (`gyro_signalen()` e `setup()`), e não pela rotina de interrupção.
 - Na zona morta, roll e pitch passam a sempre converter o retorno `int` para `float`, e o yaw (com canal 3 > 1050) passa a sempre fazer a divisão por `3.0`, operações que antes eram puladas. Há ainda uma chamada de função por eixo no código-fonte (o compilador pode ou não expandi-la no local); o efeito no tempo do laço não foi medido.
 - A atomicidade da leitura dos dados do receptor gravados pela rotina de interrupção não foi tratada aqui e fica para a AP.3.
+
+---
+
+## Melhoria AO.3 — Validação dos cálculos do acelerômetro
+
+**Responsável:** AO (identificação completa a confirmar)
+
+**Branch:** `fix/accelerometer-validation`
+
+**Arquivos modificados:** `YMFC-AL_esc_calibrate.ino` e `README.md`.
+
+### 1. Problema identificado
+
+No comando `'a'` do `YMFC-AL_esc_calibrate.ino`, os ângulos de pitch e roll do acelerômetro são calculados com `asin(acc / acc_total_vector[0])`, em que `acc_total_vector[0]` é o módulo do vetor de aceleração (a raiz da soma dos quadrados dos três eixos). O código não conferia o denominador nem o argumento do `asin`, e a soma dos quadrados era feita em um tipo que podia estourar. Isso deixava três problemas possíveis:
+
+- **Divisão por zero:** se os três eixos valem zero, o módulo é 0 e a conta vira 0.0/0.0, cujo resultado é NaN ("not a number", um valor que não representa número nenhum). Isso pode acontecer nestes casos:
+  - gyro tipo 2 ou 3 gravado na EEPROM: `gyro_signalen()` só lê o acelerômetro quando `eeprom_data[31] == 1`; nos outros casos, `acc_axis` continua valendo 0;
+  - mapeamento de eixo em `eeprom_data[28..30]` com os dois bits mais baixos valendo 0 (EEPROM corrompida): `acc_axis[0]` nunca é escrito e vale 0;
+  - sensor devolvendo zeros.
+- **Argumento fora do domínio:** o `asin` só aceita valores entre −1 e +1 e, fora desse intervalo, também devolve NaN.
+- **Estouro na soma dos quadrados:** a soma `(acc_x*acc_x)+(acc_y*acc_y)+(acc_z*acc_z)` era feita em `long` com sinal. Cada quadrado cabe (no máximo 32768² = 1 073 741 824), mas a soma dos três pode chegar a 3 221 225 472, acima de 2 147 483 647 (LONG_MAX), quando o módulo combinado passa de cerca de 46 341 LSB (≈ 11,31 g). O resultado é comportamento indefinido em C++ e, na prática, um denominador sem sentido: normalmente o valor dá a volta e fica negativo, e o `sqrt` dá NaN. Isso só ocorre com o sensor saturado; é improvável na bancada, mas representável pelos dados.
+
+O `YMFC-AL_Flight_controller.ino` já tinha essa proteção (linhas 208 e 211, `if(abs(acc_y) < acc_total_vector)`, com o comentário "Prevent the asin function to produce a NaN"), mas o esc_calibrate não tinha.
+
+Em linguagem simples: depois que um NaN gerado no cálculo do acelerômetro (por qualquer um dos três problemas acima) entra na estimativa do ângulo, ele não sai mais, porque qualquer conta com NaN dá NaN (NaN · 0.9996 + ... continua NaN). Além disso, a transferência de yaw (linhas 284–285) leva o NaN de um eixo para o outro. A estimativa só volta ao normal com um novo comando serial, que zera `cal_int` e `first_angle`, e a recalibração (AO.1) zera os ângulos. Até lá, o monitor serial mostra "nan" em Pitch e Roll.
+
+### 2. Conteúdo das aulas relacionado
+
+- Aula 0x0002 (Revisão de Linguagem C), p. 3: tipos `int` e `float` e seus limites; o slide indica `int` com 16 bits "em plataformas mais antigas" e remete aos limites descritos em `limits.h` (de onde vêm `LONG_MAX` e `ULONG_MAX`).
+- Aula 0x0002, p. 4: tipo `bool`, com os valores `true` e `false`, usado nas duas variáveis de validação (`boolean` no Arduino).
+- Aula 0x0002, p. 5: modificadores de `int`; `long` "garante um tamanho de 32 bits", `unsigned` faz o tipo representar "apenas números não negativos" e, entre as demais possibilidades, aparece `unsigned long int (uint32_t)`, o tipo usado na soma dos quadrados.
+- Aula 0x0002, pp. 8–9: condicionais `if`/`else`, usadas para calcular e aplicar cada eixo somente quando ele é válido.
+- Aula 0x0002, p. 19: operadores matemáticos e lógicos (`<`, `&&`) usados na condição.
+- Sistemas Embarcados (EESC, Ago/2026), p. 23: sensores (apenas fotos, sem conteúdo específico sobre acelerômetro).
+
+Conhecimento externo às aulas:
+
+- `math.h` do avr-libc: `asin` tem erro de domínio para argumentos fora de [−1, +1] e `sqrt` calcula a raiz quadrada.
+- MPU-6050 configurado em ±8 g, ou seja, 4096 LSB/g (registrador ACCEL_CONFIG com `0x10`, linhas 481–482 do esc_calibrate).
+- avr-gcc: `double` é igual a `float` de 32 bits, `int` tem 16 bits e `long` tem 32 bits; `unsigned long` também tem 32 bits, de 0 a 4 294 967 295.
+- A macro `abs` do `Arduino.h`.
+- Propagação de NaN em ponto flutuante: uma operação com NaN dá NaN.
+- Estouro de inteiro com sinal: em C++, é comportamento indefinido (o padrão não garante o resultado).
+- Formato `float` de 32 bits (IEEE 754): inteiros até 2^24 = 16 777 216 são representados exatamente.
+
+### 3. Alteração realizada
+
+Antes (soma dos quadrados em `long`; cálculo e filtro aplicados sempre):
+
+```cpp
+acc_total_vector[0] = sqrt((acc_x*acc_x)+(acc_y*acc_y)+(acc_z*acc_z));
+
+angle_pitch_acc = asin((float)acc_y/acc_total_vector[0])* 57.296;
+angle_roll_acc = asin((float)acc_x/acc_total_vector[0])* -57.296;
+
+if(!first_angle){
+  angle_pitch = angle_pitch_acc;
+  angle_roll = angle_roll_acc;
+  first_angle = true;
+}
+else{
+  angle_pitch = angle_pitch * 0.9996 + angle_pitch_acc * 0.0004;
+  angle_roll = angle_roll * 0.9996 + angle_roll_acc * 0.0004;
+}
+```
+
+Depois (soma dos quadrados em `unsigned long`; validação por eixo, com a mesma condição do Flight controller):
+
+```cpp
+acc_total_vector[0] = sqrt((unsigned long)(acc_x*acc_x)+(unsigned long)(acc_y*acc_y)+(unsigned long)(acc_z*acc_z));
+
+boolean pitch_acc_valid = abs(acc_y) < acc_total_vector[0];
+boolean roll_acc_valid = abs(acc_x) < acc_total_vector[0];
+
+if(pitch_acc_valid)angle_pitch_acc = asin((float)acc_y/acc_total_vector[0])* 57.296;
+if(roll_acc_valid)angle_roll_acc = asin((float)acc_x/acc_total_vector[0])* -57.296;
+
+if(!first_angle){
+  if(pitch_acc_valid && roll_acc_valid){
+    angle_pitch = angle_pitch_acc;
+    angle_roll = angle_roll_acc;
+    first_angle = true;
+  }
+}
+else{
+  if(pitch_acc_valid)angle_pitch = angle_pitch * 0.9996 + angle_pitch_acc * 0.0004;
+  if(roll_acc_valid)angle_roll = angle_roll * 0.9996 + angle_roll_acc * 0.0004;
+}
+```
+
+As duas variáveis `boolean` são locais, dentro do ramo `else` do comando `'a'`. Nenhuma variável global, função, constante ou biblioteca foi criada, e nenhum tipo de 64 bits foi usado. A equação do módulo é a mesma; só o tipo da soma passou para `unsigned long`. As equações dos ângulos, os coeficientes (`57.296`, `0.9996`, `0.0004`), a integração do giroscópio e a transferência de yaw (linhas 280–285), a recalibração da AO.1 (linhas 236–244), as impressões e os pulsos dos ESCs não mudaram, e os comentários originais foram mantidos. `YMFC-AL_Flight_controller.ino` e `YMFC-AL_setup.ino` não foram alterados.
+
+### 4. Justificativa
+
+- Uma única condição por eixo cobre os dois primeiros problemas: se `|acc| < total`, o total é necessariamente maior que zero (não há divisão por zero) e o argumento do `asin` fica entre −1 e +1, sem incluir os extremos.
+- O domínio matemático do `asin` é [−1, +1] e inclui os extremos (asin(±1) = ±90°). A condição adotada, `|acc| < total`, é mais restritiva (exclui ±1) e é a mesma usada pelo autor no Flight controller (linhas 208 e 211), sem ampliar o limite.
+- Com o truncamento do módulo, o argumento ±1 também surge em vetores cujo ângulo real é menor que 90°. Por exemplo, (1, 1, 0) dá total 1, ou seja ±90°, com ângulo real de 45°. A condição estrita descarta esses casos e também medições legítimas perto de ±90°; não se afirma ganho de precisão.
+- A validação é feita por eixo: um eixo inválido não impede a correção do outro. A inicialização (`first_angle`) só acontece quando os dois ângulos do acelerômetro são válidos, para que a estimativa não comece com um ângulo do acelerômetro inválido.
+- O terceiro problema é tratado no tipo da soma: `unsigned long` (32 bits, até 4 294 967 295) é suficiente para a soma máxima de 3 221 225 472, sem tipos de 64 bits. Os quadrados nunca são negativos, e o cast em cada termo deixa a conversão explícita: cada multiplicação continua em `long` (onde cada quadrado cabe) e só depois é convertida, antes da soma. Uma validação feita depois do `sqrt` não bastaria, porque o estouro acontece antes dele.
+- Para S ≤ 2 147 483 647, o resultado é idêntico ao original: um valor não negativo é o mesmo número em `long` e em `unsigned long` e, portanto, é convertido para o mesmo `float`. No código gerado (avr-objdump), `__floatunsisf` só zera o indicador de sinal e salta para o mesmo trecho que `__floatsisf` usa quando o valor não é negativo.
+- As equações e os coeficientes do filtro foram preservados; no eixo inválido, a correção daquele ciclo é pulada. A validação apenas evita usar um ângulo do acelerômetro que não pode ser calculado.
+
+### 5. Resultados de compilação
+
+Em 27/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os três sketches foram compilados com `--clean --warnings all` a partir de cópias em pastas separadas: a referência ("antes") foi exportada da develop (`786df67`) e a versão final ("depois", já com a soma em `unsigned long`) foi copiada da cópia de trabalho.
+
+| Sketch | Flash antes | Flash depois | SRAM global antes | SRAM global depois |
+|---|---:|---:|---:|---:|
+| `YMFC-AL_Flight_controller.ino` | 12404 bytes | 12404 bytes | 501 bytes | 501 bytes |
+| `YMFC-AL_esc_calibrate.ino` | 13126 bytes | 13444 bytes | 1106 bytes | 1114 bytes |
+| `YMFC-AL_setup.ino` | 20680 bytes | 20680 bytes | 532 bytes | 532 bytes |
+
+O esc_calibrate passou a ocupar 318 bytes a mais de Flash e 8 bytes a mais de SRAM global (sobram 934 bytes para variáveis locais, contra 942 antes). Pela tabela de símbolos (`avr-nm`), todo o aumento de Flash está em `main` (onde o compilador expande o `loop()`: 4252 bytes antes e 4570 depois), e nenhuma função de biblioteca nova foi ligada; a distribuição desses bytes no código gerado não foi analisada. A soma em `unsigned long` não alterou nenhum tamanho: uma compilação intermediária, só com a validação e ainda com a soma em `long`, deu os mesmos 13444 bytes de Flash e 1114 bytes de SRAM, com a mesma tabela de símbolos. Comparando os dois códigos com o `avr-objdump`, só uma instrução mudou: a chamada de conversão para `float` antes do `sqrt` do comando `'a'`, que passou de `__floatsisf` para `__floatunsisf`. As duas rotinas já estavam ligadas na develop, no mesmo bloco de código. A conversão do modo de vibração (linha 207) continua chamando `__floatsisf`. Também pelo `avr-nm`, os 8 bytes de SRAM são as variáveis globais já existentes `angle_pitch_acc` e `angle_roll_acc` (4 bytes cada). Na versão original, o compilador as eliminava, porque eram sempre escritas antes de serem lidas; agora, com a escrita condicional, elas passam a ocupar memória. As duas variáveis `boolean` novas são locais e não entram na SRAM global.
+
+Com `--warnings all`, os avisos foram os mesmos antes e depois: 4 de `new.cpp` do core em cada sketch e, no setup, 1 já existente em `wait_for_receiver()` (`'now' may be used uninitialized`). Nenhum aviso novo, nem nas linhas alteradas.
+
+### 6. Verificações realizadas
+
+Os casos abaixo foram simulados por cálculo (4096 LSB/g, `long` de 32 bits com volta no original, soma em `unsigned long` na versão final, `float` de 32 bits e truncamento do `sqrt` na atribuição a `long`), e não executados na placa. Os valores foram recalculados com um script Python que simula o `float` de 32 bits (numpy `float32`). O "total" é o valor guardado em `acc_total_vector[0]`.
+
+Cenários físicos (sensor lido normalmente, cerca de 1 g):
+
+| Entrada (x, y, z) | Original | Após | Ângulos |
+|---|---|---|---|
+| (0, 0, 4096), nivelado | total 4096; pitch 0°, roll 0° | igual | atualizados |
+| (0, 2048, 3547) | total 4095; pitch 30,008° | igual | atualizados |
+| (0, −2048, 3547) | total 4095; pitch −30,008° | igual | atualizados |
+| (2048, 0, 3547) | total 4095; roll −30,008° (sinal negativo pelo `-57.296`) | igual | atualizados |
+| (0, 0, −4096), invertido | total 4096; argumentos 0, válidos | igual | atualizados |
+| (0, 4096, 0), argumento exatamente +1 | pitch 90° | pitch rejeitado (4096 < 4096 é falso); roll válido | pitch preservado, roll atualizado; a inicialização espera |
+| (0, −4096, 0), argumento exatamente −1 | pitch −90° | pitch rejeitado | pitch preservado |
+| (0, 4096, 50) | total 4096 por truncamento → 90° (o valor real seria 89,30°) | pitch rejeitado | pitch preservado |
+| (0, 4096, 91) | total 4097 → 88,734° | válido | atualizado |
+
+Extremos representáveis e falhas (os valores perto de ±32768 exigem o sensor saturado em ±8 g, o que só é possível sob choque):
+
+| Entrada (x, y, z) | S | Original | Após (total; pitch; roll) |
+|---|---:|---|---|
+| (0, 0, 0), componentes nulos | 0 | total 0 → 0/0 → NaN nos dois eixos | 0; os dois eixos rejeitados (0 < 0 é falso), sem divisão e sem `asin`; ângulos preservados (só o giroscópio) |
+| (1, 1, 0) e (1, 1, 1), vetor minúsculo | 2 e 3 | total 1 → pitch +90° e roll −90° espúrios | 1; os dois eixos rejeitados; ângulos preservados |
+| (32768, 32768, 32768) | 3 221 225 472 | estouro (indefinido; normalmente −1 073 741 824 → `sqrt` NaN) | 56755; 35,265°; −35,265°; atualizados |
+| (−32768, −32768, −32768), só em eixos não invertidos | 3 221 225 472 | estouro | 56755; −35,265°; +35,265° |
+| (32767, 32767, 32767) | 3 221 028 867 | estouro | 56754; 35,265°; −35,265° |
+| (26755, 26755, 26755), primeiro trio igual que estoura | 2 147 490 075 | estouro | 46341; 35,265°; −35,265° |
+| (26754, 26754, 26754) | 2 147 329 548 | 46339; ±35,265° | idêntico |
+| (32767, 32767, 363) | 2 147 484 347 | estouro | 46340; 45,000°; −45,000° |
+| (32767, 32767, 362) | 2 147 483 622 | 46340; ±45,000° | idêntico |
+| (32768, 32768, 0) | 2 147 483 648 = 2^31 | estouro | 46340; 45,001°; −45,001° |
+| (−32768, 32768, 0) | 2^31 | estouro | 46340; pitch 45,001°; roll +45,001° |
+| (32768, 0, 0) | 2^30 | total 32768; roll com argumento +1 (−90°, pelo `-57.296`) | igual; roll rejeitado, pitch 0° atualizado |
+| (0, 32768, 0) | 2^30 | total 32768; pitch +90° | pitch rejeitado, roll 0° atualizado |
+| (0, 32768, 256) | 1 073 807 360 | total 32769 (sqrt exato 32768,99998, arredondado em `float` para 32769,0); pitch 89,553° | idêntico; aceito (o limite depende do arredondamento) |
+| Argumento < −1 ou > +1 | — | NaN | não ocorre para nenhum valor representável (\|acc\| ≤ 32768), porque floor(sqrt(float(S))) ≥ \|acc\|; se ocorresse, a condição estrita rejeitaria; ângulos preservados |
+
+S é a soma dos três quadrados, antes do `sqrt`. Um eixo só vale +32768 quando é invertido (`*= -1` aplicado a −32768), e −32768 só aparece em eixo não invertido. A desigualdade floor(sqrt(float(S))) ≥ |acc| foi conferida por cálculo para todos os |acc| de 0 a 32768 com os outros dois eixos em zero, que é o pior caso: a conversão para `float` e o `sqrt` não diminuem quando S aumenta.
+
+Sequências de ciclos:
+
+1. **Inválido na primeira estimativa e válido depois.** Original: o NaN entra em `angle_pitch`/`angle_roll`, `first_angle` vira `true`, o NaN fica permanente e passa ao outro eixo. Após: `first_angle` continua `false` até um ciclo com os dois eixos válidos, e só então a estimativa é iniciada.
+2. **Inválido depois de uma estimativa válida.** Original: o NaN fica permanente. Após: a correção daquele eixo é pulada no ciclo e a estimativa mantém a integração do giroscópio.
+3. **Restabelecimento.** Original: só com um novo comando serial. Após: no próximo ciclo válido, o filtro volta a corrigir o eixo.
+4. **AO.1.** As linhas 236–244 ficaram intactas. Depois do reset, `first_angle = false`, e a nova regra só controla em que ciclo a inicialização acontece.
+
+A análise de NaN se limita ao trecho do acelerômetro alterado; outras partes do firmware não foram analisadas.
+
+Tipos e estouro:
+
+- A faixa de cada eixo vai de −32768 a +32768: `acc_axis` é `int` (−32768 a 32767), e o `*= -1` é feito em `long` (linhas 533–538), então −32768 invertido vira +32768.
+- Cada quadrado é no máximo 32768² = 1 073 741 824 e cabe em `long`.
+- A soma dos três é no máximo 3 221 225 472: acima de LONG_MAX (2 147 483 647), mas abaixo de ULONG_MAX (4 294 967 295).
+- No original, o estouro começava quando o módulo combinado passava de cerca de 46 341 LSB (≈ 11,31 g). Com a soma em `unsigned long`, não há estouro em toda a faixa.
+- O total é no máximo 56 755.
+- Inteiros até 2^24 = 16 777 216 são exatos em `float`. Como o numerador (|acc| ≤ 32768) e o denominador (total ≤ 56 755) ficam abaixo disso, os dois chegam exatos à divisão. Um S acima de 2^24 é arredondado na conversão para `float`, antes do `sqrt`, como já acontecia no original.
+- Em repouso, S ≈ 16,8 milhões (4096² = 16 777 216), cerca de 0,8 % de LONG_MAX.
+
+### 7. Limitações
+
+- Não houve teste em hardware nem medição de tempo. As duas comparações e os desvios acrescentados têm custo pequeno, que não foi medido.
+- Uma medição é rejeitada quando o módulo truncado fica igual a |acc|. Sem considerar o arredondamento do `float`, isso ocorre quando a soma dos quadrados dos outros dois eixos é ≤ 2·|acc|. O ângulo correspondente não é fixo: ≈ 35,26° para |acc| = 1 (vetor (1, 1, 1)), ≈ 88,73° para |acc| = 4096 (1 g) e ≈ 89,55° para |acc| = 32768. O arredondamento do `float` pode deslocar esse limite; por exemplo, (0, 32768, 256) é aceito com 89,553°.
+- Se um eixo ficar permanentemente perto de 90°, a inicialização espera.
+- A análise supõe que o `sqrt` do avr-libc é corretamente arredondado, o que o header não documenta.
+- Os gyros tipo 2 ou 3 continuam sem leitura no esc_calibrate: `gyro_signalen()` só lê o MPU-6050, então o acelerômetro e o giroscópio ficam em zero. Agora os dois eixos são rejeitados e o trecho do acelerômetro deixa de gerar NaN, mas os ângulos continuam sem medição real.
+- O Flight controller continua reaproveitando o `angle_*_acc` antigo quando um eixo é inválido (fora do escopo desta melhoria).
+- O mesmo cálculo com soma em `long` continua em `YMFC-AL_Flight_controller.ino` (linha 206) e no modo de vibração do esc_calibrate (linha 207, comandos `'1'` a `'5'`). Esses trechos ficaram fora do escopo da AO.3, que trata dos ângulos do comando `'a'`.
+- Com o sensor saturado, o ângulo agora é calculado e usado pelo filtro. Sob choque, porém, o acelerômetro não mede só a gravidade, e esse ângulo não representa a orientação.
