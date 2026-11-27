@@ -1273,3 +1273,126 @@ Tipos e estouro:
 - O Flight controller continua reaproveitando o `angle_*_acc` antigo quando um eixo é inválido (fora do escopo desta melhoria).
 - O mesmo cálculo com soma em `long` continua em `YMFC-AL_Flight_controller.ino` (linha 206) e no modo de vibração do esc_calibrate (linha 207, comandos `'1'` a `'5'`). Esses trechos ficaram fora do escopo da AO.3, que trata dos ângulos do comando `'a'`.
 - Com o sensor saturado, o ângulo agora é calculado e usado pelo filtro. Sob choque, porém, o acelerômetro não mede só a gravidade, e esse ângulo não representa a orientação.
+
+---
+
+## Melhoria AP.3 — Proteção de variáveis compartilhadas
+
+**Responsável:** AP (identificação completa a confirmar)
+
+**Branch:** `fix/atomic-receiver-read`
+
+**Arquivos modificados:** `YMFC-AL_Flight_controller.ino` e `README.md`.
+
+Os números de linha citados são os do código original (develop `7f82cc8`), exceto onde se indica "na versão modificada".
+
+### 1. Problema identificado
+
+No `YMFC-AL_Flight_controller.ino`, a rotina de interrupção `ISR(PCINT0_vect)` mede a largura dos pulsos do receptor e grava o resultado em `receiver_input[1..4]`, que o programa principal lê em `convert_receiver_channel()`.
+
+| Variável | Tipo e tamanho | Quem escreve | Quem lê | Compartilhada com a ISR? |
+|---|---|---|---|---|
+| `receiver_input[1..4]` | `int`, 2 bytes cada (vetor de 5, 10 bytes) | ISR (linhas 380, 391, 402 e 414) | `convert_receiver_channel()` (linha 547) | Sim |
+| `receiver_input_channel_1..4` | `volatile int`, 2 bytes | programa principal (linhas 152–153 e 429–432) | `setup()` e `loop()` | Não |
+| `timer_1..4`, `current_time` | `unsigned long`, 4 bytes | ISR | ISR | Não |
+| `last_channel_1..4` | `byte`, 1 byte | ISR | ISR | Não |
+
+A cópia `actual = receiver_input[channel];` (linha 547) lê 16 bits, mas o ATmega328P carrega só 8 bits por instrução. No avr-objdump do original, ela vira dois loads: `ld r0, X+` (byte baixo) e depois `ld r27, X` (byte alto). Se o pulso daquele canal terminar entre essas duas instruções, a ISR roda no meio da leitura, e o programa fica com o byte baixo do valor antigo e o byte alto do novo. As larguras medidas são múltiplas de 4 µs (resolução do `micros()` no Uno a 16 MHz). Exemplo, com o byte baixo lido primeiro, como no objdump:
+
+| Transição | Byte baixo lido (antigo) | Byte alto lido (novo) | Valor copiado |
+|---|---|---|---|
+| 1276 (0x04FC) → 1280 (0x0500) | 0xFC | 0x05 | 0x05FC = 1532 |
+
+Na transição inversa (1280 → 1276), o valor copiado seria 0x0400 = 1024. Nos dois casos, o valor copiado não é o antigo nem o novo. O erro só aparece quando o byte alto muda, ou seja, quando a largura cruza 1024, 1280, 1536 ou 1792 µs, e a ISR cai exatamente naquela janela; é raro, mas possível. O valor errado seria convertido e viraria o comando do canal por um ciclo de 4 ms; em tese, um throttle ou yaw errado poderia satisfazer uma das condições de armamento ou desarmamento (linhas 232–245). Isso não foi observado; é uma possibilidade da análise.
+
+Os `receiver_input_channel_1..4` não são compartilhados, porque a ISR não mexe neles: eles recebem o retorno de `convert_receiver_channel()` em `gyro_signalen()` ou no laço do `setup()` e são lidos no `loop()`, tudo no programa principal, que não interrompe a si mesmo. Por isso a AP.2 pôde passá-los por valor sem proteção e deixou a atomicidade para esta melhoria. (No `YMFC-AL_setup.ino`, ao contrário, a ISR grava diretamente os `receiver_input_channel_*`, e a E.1 os protegeu lá.)
+
+### 2. Conteúdo das aulas relacionado
+
+- Semáforos, Parte 1, pp. 2–4: comunicação interprocessos; vantagens de múltiplos processos ("Concorrência", "Características assíncronas", "Orientado a Dados / Eventos") e formas de comunicar, entre elas "Memória compartilhada (superposição de contextos)" e "Instruções de sincronização (suporte de hardware)". Aqui, os dois contextos são o `loop()` e a ISR, e a memória compartilhada é `receiver_input[]`.
+- Semáforos, Parte 2, pp. 5–6 ("Simultaneous Transactions" e "But, what if…"): duas execuções intercaladas no nível das instruções (`LD`, `SUB`, `ST`) corrompem um dado compartilhado; os trechos chamados "CRITICAL SECTIONS" não podem se sobrepor, restrição chamada "MUTUAL EXCLUSION", e a solução é garantir sua "atomicity", isto é, fazê-los parecer "single, instantaneous operations". É o mesmo problema dos dois `ld`.
+- Semáforos, Parte 2, pp. 7–8: "Semaphores for Mutual Exclusion" e "Producer/Consumer Atomicity Problems". A "Granularity of lock" (p. 7) corresponde aqui à escolha de proteger um canal por vez, e o semáforo com `wait`/`signal` (Parte 1, pp. 8–9) fica só como contraste.
+- Internet e Sockets, pp. 45–47 (analogia: ali o contexto são threads e sistema operacional): threads compartilham "Variáveis em memória", com "problemas de concorrência" (p. 45); exemplos são "variáveis e arrays globais", e a solução é "Proteger o acesso concorrente" (p. 46); o mutex isola "regiões críticas (trechos do código que utilizam recursos compartilhados)" (p. 47).
+- Aula 0x0002 (Revisão de Linguagem C), p. 3: `int` com "16 bits (2 bytes) em plataformas mais antigas", caso do AVR.
+
+Conhecimento externo às aulas:
+
+- `volatile`: obriga o compilador a ler e escrever a variável na memória a cada acesso.
+- `ISR(PCINT0_vect)`: na entrada da interrupção, o hardware zera o bit I do SREG, e a ISR não é interrompida pelo programa principal.
+- SREG, `cli` e `util/atomic.h` (avr-libc): o bit I do registrador de estado (SREG, I/O 0x3F) habilita as interrupções e `cli` o zera; `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` salva o SREG, executa `cli` e restaura o SREG na saída do bloco.
+- AVR de 8 bits: `ld` carrega um byte por instrução, e a CPU atende interrupções ao fim de qualquer instrução.
+- `micros()` com resolução de 4 µs no Uno a 16 MHz (Timer0 com prescaler 64).
+
+### 3. Alteração realizada
+
+Três alterações em `YMFC-AL_Flight_controller.ino`. As duas primeiras são um novo include depois de `EEPROM.h` (linha 20 na versão modificada) e o `volatile` na declaração da linha 71, que antes era `int receiver_input[5];` (linha 72 na versão modificada):
+
+```cpp
+#include <util/atomic.h>                   //Inclui a util/atomic.h para usar ATOMIC_BLOCK (secao critica na leitura do receptor)
+volatile int receiver_input[5]; // Escrito pela ISR(PCINT0_vect) e lido em convert_receiver_channel()
+```
+
+A terceira, em `convert_receiver_channel()`, coloca a cópia da linha 547 (a linha do meio é a linha 547 original, com dois espaços a mais de recuo) dentro de uma seção crítica (linhas 548–550 na versão modificada):
+
+```cpp
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE){                                           //Secao critica: a ISR(PCINT0_vect) nao interrompe a leitura dos 2 bytes
+    actual = receiver_input[channel];                                          //Read the actual receiver value for the corresponding function
+  }                                                                            //Fim da secao critica: o SREG (bit I) volta ao estado anterior
+```
+
+Dentro do bloco fica só a cópia, com o comentário original. Não mudaram: a ISR, a escolha de `channel` e `reverse`, a leitura da EEPROM e a conversão para 1000–2000 µs, as condições de armamento, a zona morta da AP.2 (`apply_dead_band()`), os pulsos dos ESCs, os ganhos, o loop de 4 ms e os outros dois sketches.
+
+### 4. Justificativa
+
+- `volatile` não garante atomicidade: só obriga o compilador a ir à memória a cada acesso. Um `volatile int` continua sendo lido em duas instruções; no objdump, os dois `ld` são iguais no original (sem `volatile`) e no modificado. O `volatile` foi acrescentado porque a variável é escrita por uma ISR; a proteção vem da seção crítica.
+- Seção crítica: como a CPU atende interrupções ao fim de qualquer instrução, a cópia dos dois bytes só é indivisível com as interrupções desabilitadas, e o `ATOMIC_BLOCK` executa `cli` antes dela. Um PCINT0 que chegue nesse intervalo não se perde: fica pendente na flag PCIF0, e a ISR roda logo depois que o SREG é restaurado. O valor novo entra na próxima conversão.
+- `ATOMIC_RESTORESTATE` salva e restaura o SREG, e o bit I volta ao estado anterior. `interrupts()` ou `ATOMIC_FORCEON` religariam as interrupções sempre, mesmo se a função fosse chamada com elas desligadas.
+- A seção crítica deve ser curta, porque com I = 0 nenhuma ISR é atendida (PCINT0, o estouro do Timer0 de `millis()`/`micros()`, o TWI do `Wire`). Por isso o bloco não tem I²C, serial, `micros()`, contas nem chamadas de função.
+- Consistência não é simultaneidade: cada valor copiado é um valor que a ISR realmente gravou. Isso não garante que os canais foram recebidos no mesmo instante nem que pertencem ao mesmo quadro do receptor.
+- A seção crítica protege a leitura individual de cada canal: ela fica dentro de `convert_receiver_channel()`, e os quatro canais não são copiados em uma única seção crítica, porque uma única alteração cobre os dois pontos de chamada (`gyro_signalen()` e o laço do `setup()`), sem mudar a assinatura nem a frequência das chamadas.
+- Reutiliza o padrão da E.1 (Melhoria 1 deste README), que usa `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` no `YMFC-AL_setup.ino` (linha 742).
+- Em bare metal, sem sistema operacional, aplica-se o conceito de seção crítica e de exclusão mútua entre dois contextos, o `loop()` e a ISR. Não se implementa um semáforo: não há `wait`/`signal`, fila nem bloqueio.
+
+### 5. Resultados de compilação
+
+Em 27/11/2026, com Arduino CLI 1.6.0, Arduino AVR Boards 1.8.8 e FQBN `arduino:avr:uno`, os três sketches foram compilados com `--clean --warnings all` a partir de cópias em pastas separadas: a referência ("antes") foi exportada da develop (`7f82cc8`) e a versão "depois" foi copiada da cópia de trabalho.
+
+| Sketch | Flash antes | Flash depois | SRAM global antes | SRAM global depois |
+|---|---:|---:|---:|---:|
+| `YMFC-AL_Flight_controller.ino` | 12404 bytes | 12410 bytes | 501 bytes | 501 bytes |
+| `YMFC-AL_esc_calibrate.ino` | 13444 bytes | 13444 bytes | 1114 bytes | 1114 bytes |
+| `YMFC-AL_setup.ino` | 20680 bytes | 20680 bytes | 532 bytes | 532 bytes |
+
+Os 6 bytes a mais do Flight são as três instruções do bloco (`in`, `cli`, `out`, 2 bytes cada). Os avisos já existentes (do core e um do setup) foram os mesmos antes e depois; nenhum aviso novo.
+
+Trecho do avr-objdump do bloco, na versão modificada (as instruções omitidas calculam o endereço do elemento; não há `call` no bloco):
+
+```
+8c0:  in   r24, 0x3f   ; salva o SREG
+8c2:  cli              ; desabilita as interrupcoes
+8d0:  ld   r0, X+      ; byte baixo
+8d2:  ld   r27, X      ; byte alto
+8d6:  out  0x3f, r24   ; restaura o SREG (bit I)
+```
+
+### 6. Verificações realizadas
+
+Por inspeção do código, análise do objdump e compilação; sem hardware.
+
+| # | Verificação | Resultado |
+|---|---|---|
+| 1 | Leitura normal | sem interrupção durante a cópia, `actual` recebe o mesmo valor do original |
+| 2 | Interrupção entre os bytes, no original | possível: nada impedia a ISR entre `ld r0, X+` e `ld r27, X` (exemplo da seção 1) |
+| 3 | Cópia dentro da seção crítica | os dois `ld` ficam entre `cli` e `out 0x3f`, sem `call`; a ISR não roda entre eles |
+| 4 | Atualização depois da cópia | a borda que chega com I = 0 fica pendente (PCIF0); a ISR roda após o `out`, e o valor novo entra na próxima chamada |
+| 5 | Interrupções e temporização | estimada, não medida (abaixo) |
+
+Tempos estimados, não medidos, a partir da contagem das instruções no objdump e dos ciclos do AVR Instruction Set Manual, a 16 MHz: o bit I fica em 0 por cerca de 0,75 µs por chamada, ou seja, cerca de 3 µs a cada ciclo de 4 ms (4 chamadas em `gyro_signalen()`). Nesse intervalo o atendimento de uma ISR pode atrasar, o que pode deslocar a medida de um pulso em um passo de 4 µs; por isso não se afirma que a temporização é idêntica à do original. Além disso, as mudanças dos pinos do receptor ficam registradas numa única flag (PCIF0): se mais de uma mudança ocorrer enquanto as interrupções estão desabilitadas, a ISR roda uma vez só e verifica, pelo `PINB`, o estado atual de cada pino (8 a 11): mudanças em pinos diferentes são todas tratadas, mas com o mesmo instante de `micros()`, sem registro individual de cada mudança; duas mudanças do mesmo pino nesse intervalo não seriam vistas, o que exigiria um pulso muito mais curto que os do receptor (o mesmo já pode ocorrer no original enquanto outras ISRs executam).
+
+### 7. Limitações
+
+- Não houve teste em hardware nem medição de tempo; a seção 6 traz só uma estimativa.
+- O `YMFC-AL_esc_calibrate.ino` tem o mesmo padrão sem proteção (declaração na linha 44, leituras nas linhas 382–385 em `wait_for_receiver()` e na linha 401 em `convert_receiver_channel()`); ficou fora do escopo.
+- Um índice de canal 0 ou de 5 a 7 vindo da EEPROM continua sem tratamento (o 0 lê `receiver_input[0]`, que nunca é escrito, e 5 a 7 leem fora do vetor); é um problema anterior.
+- A AP.3 não implementa um failsafe; o diagnóstico da perda de sinal do receptor fica para a E.3.
+- O `volatile` dos `receiver_input_channel_*` (linha 47) foi mantido, embora não seja necessário.
